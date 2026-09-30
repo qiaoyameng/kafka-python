@@ -939,6 +939,88 @@ def test_fetched_records_other_partitions_progress_while_one_paused(fetcher, top
     assert partial is False
 
 
+def test_overlapping_timed_pauses_keep_request_cache_and_paused_query_consistent(
+        client, metrics, mocker):
+    class FakeClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def time(self):
+            return self.now
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    subscriptions = SubscriptionState(time_func=clock.time)
+    tp0 = TopicPartition('paused-topic', 0)
+    tp1 = TopicPartition('paused-topic', 1)
+    subscriptions.assign_from_user([tp0, tp1])
+    subscriptions.seek(tp0, 0)
+    subscriptions.seek(tp1, 0)
+    fetcher = Fetcher(client, subscriptions, metrics=metrics)
+    fetcher.config['check_crcs'] = False
+
+    mocker.patch.object(fetcher._manager.cluster, 'leader_for_partition', return_value=0)
+    mocker.patch.object(fetcher._manager.cluster, 'leader_epoch_for_partition', return_value=0)
+    mocker.patch.object(fetcher._manager, 'connection_delay', return_value=0)
+    mocker.patch.object(fetcher._client, 'throttle_delay', return_value=0)
+
+    def requested_partitions():
+        fetcher._nodes_with_pending_fetch_requests.clear()
+        request = next(iter(fetcher._create_fetch_requests().values()))[0]
+        return {
+            TopicPartition(topic.topic, partition_data.partition)
+            for topic in request.topics
+            for partition_data in topic.partitions
+        }
+
+    assert requested_partitions() == {tp0, tp1}
+
+    throttle = subscriptions.pause_with_reason(tp0, reason='downstream_throttle')
+    maintenance = subscriptions.pause_with_reason(
+        tp0, reason='manual_maintenance', timeout_ms=1000)
+
+    fetcher._completed_fetches.append(_build_completed_fetch(tp0, _paused_msgs(5)))
+    records, partial = fetcher.fetched_records()
+    assert records == {}
+    assert partial is False
+    assert tp0 in fetcher._paused_completed_fetches
+
+    send = mocker.patch.object(fetcher._manager, 'send')
+    fetcher.send_fetches()
+    sent_request = send.call_args.args[0]
+    sent_partitions = {
+        TopicPartition(topic.topic, partition_data.partition)
+        for topic in sent_request.topics
+        for partition_data in topic.partitions
+    }
+    assert sent_partitions == {tp1}
+
+    assert requested_partitions() == {tp1}
+    assert subscriptions.paused_partitions() == {tp0}
+
+    clock.advance(0.5)
+    subscriptions.renew_pause_token(maintenance, timeout_ms=1000)
+    subscriptions.resume_pause_token(throttle)
+
+    clock.advance(0.6)
+    assert subscriptions.paused_partitions() == {tp0}
+    assert requested_partitions() == {tp1}
+    records, _ = fetcher.fetched_records()
+    assert records == {}
+    assert tp0 in fetcher._paused_completed_fetches
+
+    clock.advance(0.5)
+    assert subscriptions.paused_partitions() == set()
+    assert requested_partitions() == {tp1}
+    records, _ = fetcher.fetched_records()
+    assert tp0 in records
+    assert len(records[tp0]) == 5
+    assert tp0 not in fetcher._paused_completed_fetches
+    assert requested_partitions() == {tp0, tp1}
+
+
 def test_fetchable_partitions_excludes_parked_pause_data(fetcher, topic, mocker):
     """A partition with parked (paused) data must not be picked up by the
     fetch-request side after resume() but before the next fetched_records()

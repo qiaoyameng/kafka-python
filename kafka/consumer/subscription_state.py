@@ -23,6 +23,26 @@ class SubscriptionType(IntEnum):
     USER_ASSIGNED = 3
 
 
+class PauseToken:
+    """A handle for a reason-scoped partition pause.
+
+    A token may cover several partitions. It remains active until it is
+    explicitly released or its optional monotonic deadline is reached.
+    """
+    __slots__ = ('reason', '_deadline')
+
+    def __init__(self, reason, deadline):
+        self.reason = reason
+        self._deadline = deadline
+
+    @property
+    def deadline(self):
+        return self._deadline
+
+    def __repr__(self):
+        return 'PauseToken(reason=%r, deadline=%r)' % (self.reason, self._deadline)
+
+
 class SubscriptionState:
     """
     A class for tracking the topics, partitions, and offsets for the consumer.
@@ -49,14 +69,18 @@ class SubscriptionState:
         " (2) subscribe to topics matching a regex pattern,"
         " (3) assign itself specific topic-partitions.")
 
-    def __init__(self, offset_reset_strategy='earliest'):
+    def __init__(self, offset_reset_strategy='earliest', time_func=time.monotonic):
         """Initialize a SubscriptionState instance
 
         Keyword Arguments:
             offset_reset_strategy: 'earliest' or 'latest', otherwise
                 exception will be raised when fetching an offset that is no
                 longer available. Default: 'earliest'
+            time_func: Monotonic clock used by timed pause tokens.
         """
+        if not callable(time_func):
+            raise TypeError('time_func must be callable')
+        self._time = time_func
         try:
             offset_reset_strategy = getattr(OffsetResetStrategy,
                                             offset_reset_strategy.upper())
@@ -71,6 +95,7 @@ class SubscriptionState:
         self._group_subscription = set()
         self._user_assignment = set()
         self.assignment = OrderedDict()
+        self._pause_tokens = {}
         self.rebalance_listener = None
         self.listeners = []
         self._lock = threading.RLock()
@@ -267,6 +292,7 @@ class SubscriptionState:
         # short-lived runs that bail before exhausting it never see
         # later partitions.
         self._apply_assignment(assignments, randomize=True)
+        self._clear_pause_tokens_after_rebalance()
         log.info("Updated partition assignment: %s", assignments)
 
     def _apply_assignment(self, partitions, randomize=False):
@@ -289,6 +315,7 @@ class SubscriptionState:
         # the keys first to avoid "dict changed size during iteration").
         for tp in list(self.assignment.keys()):
             if tp not in new_set:
+                self._discard_pause_token_partition(tp)
                 del self.assignment[tp]
             else:
                 # Retained partitions are no longer pending_revocation
@@ -300,7 +327,19 @@ class SubscriptionState:
         if randomize:
             random.shuffle(new_partitions)
         for tp in new_partitions:
-            self.assignment[tp] = TopicPartitionState()
+            self.assignment[tp] = TopicPartitionState(self._time)
+
+    def _clear_pause_tokens_after_rebalance(self):
+        for state in self.assignment.values():
+            state.clear_pause_tokens()
+        self._pause_tokens.clear()
+
+    def _discard_pause_token_partition(self, partition):
+        for token in list(self._pause_tokens):
+            partitions = self._pause_tokens[token]
+            partitions.discard(partition)
+            if not partitions:
+                self._pause_tokens.pop(token, None)
 
     @synchronized
     def unsubscribe(self):
@@ -308,6 +347,7 @@ class SubscriptionState:
         self.subscription = None
         self._user_assignment.clear()
         self.assignment.clear()
+        self._pause_tokens.clear()
         self.subscribed_pattern = None
         self.subscription_type = SubscriptionType.NONE
 
@@ -353,12 +393,14 @@ class SubscriptionState:
     @synchronized
     def paused_partitions(self):
         """Return current set of paused TopicPartitions."""
+        self._prune_expired_pause_tokens()
         return set(partition for partition in self.assignment
                    if self.is_paused(partition))
 
     @synchronized
     def fetchable_partitions(self):
         """Return ordered list of TopicPartitions that should be Fetched."""
+        self._prune_expired_pause_tokens()
         fetchable = list()
         for partition, state in self.assignment.items():
             if state.is_fetchable():
@@ -504,7 +546,10 @@ class SubscriptionState:
 
     @synchronized
     def is_paused(self, partition):
-        return partition in self.assignment and self.assignment[partition].paused
+        if partition not in self.assignment:
+            return False
+        self._prune_expired_pause_tokens()
+        return self.assignment[partition].paused
 
     @synchronized
     def is_fetchable(self, partition):
@@ -517,6 +562,72 @@ class SubscriptionState:
     @synchronized
     def resume(self, partition):
         self.assignment[partition].resume()
+
+    @synchronized
+    def pause_with_reason(self, *partitions, reason, timeout_ms=None):
+        """Pause partitions with an independently resumable reason token."""
+        if not partitions:
+            raise ValueError('At least one partition is required')
+        if not isinstance(reason, str) or not reason:
+            raise ValueError('reason must be a non-empty string')
+        deadline = self._pause_deadline(timeout_ms)
+        token = PauseToken(reason, deadline)
+
+        assigned = self.assignment
+        token_partitions = set()
+        if any(partition not in assigned for partition in partitions):
+            raise Errors.IllegalStateError('Partition is not assigned')
+        for partition in partitions:
+            assigned[partition].add_pause_token(token, deadline)
+            token_partitions.add(partition)
+        self._pause_tokens[token] = token_partitions
+        return token
+
+    @synchronized
+    def resume_pause_token(self, token):
+        """Release one reason token from all of its partitions."""
+        if not isinstance(token, PauseToken):
+            raise TypeError('token must be a PauseToken')
+        partitions = self._pause_tokens.pop(token, set())
+        for partition in partitions:
+            state = self.assignment.get(partition)
+            if state is not None:
+                state.remove_pause_token(token)
+
+    @synchronized
+    def renew_pause_token(self, token, timeout_ms=None):
+        """Extend an active token, replacing its previous deadline atomically."""
+        if not isinstance(token, PauseToken):
+            raise TypeError('token must be a PauseToken')
+        self._prune_expired_pause_tokens()
+        if token not in self._pause_tokens:
+            raise ValueError('Pause token is not active')
+        deadline = self._pause_deadline(timeout_ms)
+        token._deadline = deadline
+        for partition in self._pause_tokens[token]:
+            state = self.assignment.get(partition)
+            if state is not None:
+                state.add_pause_token(token, deadline)
+        return token
+
+    def _pause_deadline(self, timeout_ms):
+        if timeout_ms is None:
+            return None
+        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, (int, float)):
+            raise TypeError('timeout_ms must be a number or None')
+        if timeout_ms <= 0:
+            raise ValueError('timeout_ms must be greater than 0')
+        return self._time() + timeout_ms / 1000.0
+
+    def _prune_expired_pause_tokens(self):
+        now = self._time()
+        for partition, state in self.assignment.items():
+            for token in state.expired_pause_tokens(now):
+                token_partitions = self._pause_tokens.get(token)
+                if token_partitions is not None:
+                    token_partitions.discard(partition)
+                    if not token_partitions:
+                        self._pause_tokens.pop(token, None)
 
     @synchronized
     def mark_pending_revocation(self, partitions):
@@ -556,8 +667,10 @@ class SubscriptionState:
 
 
 class TopicPartitionState:
-    def __init__(self):
-        self.paused = False # whether this partition has been paused by the user
+    def __init__(self, time_func=time.monotonic):
+        self._legacy_paused = False # whether the legacy pause() API paused this partition
+        self._time = time_func
+        self._pause_tokens = {}
         self.reset_strategy = None # the reset strategy if awaiting_reset is set
         self._position = None # OffsetAndMetadata exposed to the user
         self.highwater = None
@@ -605,6 +718,17 @@ class TopicPartitionState:
 
     position = property(_get_position, _set_position, None, "last position")
 
+    @property
+    def paused(self):
+        now = self._time()
+        return self._legacy_paused or any(
+            deadline is None or deadline > now
+            for deadline in self._pause_tokens.values())
+
+    @paused.setter
+    def paused(self, value):
+        self._legacy_paused = bool(value)
+
     def reset(self, strategy):
         if strategy is None:
             raise ValueError('strategy cannot be None')
@@ -649,10 +773,26 @@ class TopicPartitionState:
         self.clear_preferred_read_replica()
 
     def pause(self):
-        self.paused = True
+        self._legacy_paused = True
 
     def resume(self):
-        self.paused = False
+        self._legacy_paused = False
+
+    def add_pause_token(self, token, deadline):
+        self._pause_tokens[token] = deadline
+
+    def remove_pause_token(self, token):
+        self._pause_tokens.pop(token, None)
+
+    def clear_pause_tokens(self):
+        self._pause_tokens.clear()
+
+    def expired_pause_tokens(self, now):
+        expired = [token for token, deadline in self._pause_tokens.items()
+                   if deadline is not None and deadline <= now]
+        for token in expired:
+            self._pause_tokens.pop(token, None)
+        return expired
 
     def mark_pending_revocation(self, val=True):
         """KIP-429: gate fetches while an on_partitions_revoked /

@@ -3,8 +3,142 @@ import time
 import pytest
 
 from kafka import TopicPartition
-from kafka.consumer.subscription_state import SubscriptionState, TopicPartitionState
+from kafka.consumer.subscription_state import (
+    PauseToken, SubscriptionState, TopicPartitionState,
+)
 from kafka.structs import OffsetAndMetadata
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def test_overlapping_pause_tokens_resume_only_when_all_released():
+    clock = FakeClock()
+    state = SubscriptionState(time_func=clock.time)
+    tp = TopicPartition('foo', 0)
+    state.assign_from_user([tp])
+    state.seek(tp, 0)
+
+    throttle = state.pause_with_reason(tp, reason='downstream_throttle')
+    maintenance = state.pause_with_reason(tp, reason='maintenance')
+
+    assert state.is_paused(tp)
+    assert state.paused_partitions() == {tp}
+    assert not state.is_fetchable(tp)
+
+    state.resume_pause_token(throttle)
+    assert state.is_paused(tp)
+    assert not state.is_fetchable(tp)
+
+    state.resume_pause_token(maintenance)
+    assert not state.is_paused(tp)
+    assert state.paused_partitions() == set()
+    assert state.is_fetchable(tp)
+
+
+def test_timed_pause_token_uses_injected_monotonic_clock():
+    clock = FakeClock()
+    state = SubscriptionState(time_func=clock.time)
+    tp = TopicPartition('foo', 0)
+    state.assign_from_user([tp])
+    state.seek(tp, 0)
+
+    state.pause_with_reason(tp, reason='throttle', timeout_ms=1000)
+    assert state.is_paused(tp)
+
+    clock.sleep(0.999)
+    assert state.is_paused(tp)
+
+    clock.sleep(0.001)
+    assert not state.is_paused(tp)
+    assert state.is_fetchable(tp)
+
+
+def test_renewed_token_is_not_released_by_its_original_deadline():
+    clock = FakeClock()
+    state = SubscriptionState(time_func=clock.time)
+    tp = TopicPartition('foo', 0)
+    state.assign_from_user([tp])
+    state.seek(tp, 0)
+
+    throttle = state.pause_with_reason(tp, reason='throttle')
+    maintenance = state.pause_with_reason(
+        tp, reason='maintenance', timeout_ms=1000)
+
+    clock.sleep(0.5)
+    state.renew_pause_token(maintenance, timeout_ms=1000)
+    state.resume_pause_token(throttle)
+
+    clock.sleep(0.501)
+    assert state.is_paused(tp)
+    assert maintenance.deadline == 1.5
+
+    clock.sleep(0.5)
+    assert not state.is_paused(tp)
+    assert state.is_fetchable(tp)
+
+
+def test_expired_token_cannot_be_renewed_by_its_old_handle():
+    clock = FakeClock()
+    state = SubscriptionState(time_func=clock.time)
+    tp = TopicPartition('foo', 0)
+    state.assign_from_user([tp])
+    token = state.pause_with_reason(tp, reason='maintenance', timeout_ms=1000)
+
+    clock.sleep(1)
+    assert not state.is_paused(tp)
+    with pytest.raises(ValueError):
+        state.renew_pause_token(token, timeout_ms=1000)
+
+
+def test_legacy_pause_and_reason_tokens_have_independent_semantics():
+    state = SubscriptionState()
+    tp = TopicPartition('foo', 0)
+    state.assign_from_user([tp])
+
+    state.pause(tp)
+    token = state.pause_with_reason(tp, reason='throttle')
+
+    state.resume(tp)
+    assert state.is_paused(tp)
+
+    state.resume_pause_token(token)
+    assert not state.is_paused(tp)
+
+    token = state.pause_with_reason(tp, reason='maintenance')
+    state.pause(tp)
+    state.resume_pause_token(token)
+    assert state.is_paused(tp)
+
+    state.resume(tp)
+    assert not state.is_paused(tp)
+
+
+def test_rebalance_reason_tokens_do_not_affect_new_assignment():
+    clock = FakeClock()
+    state = SubscriptionState(time_func=clock.time)
+    state.subscribe(topics=['foo'])
+    tp = TopicPartition('foo', 0)
+    state.assign_from_subscribed([tp])
+    state.seek(tp, 10)
+    token = state.pause_with_reason(tp, reason='maintenance', timeout_ms=1000)
+
+    state.assign_from_subscribed([tp])
+    assert state.position(tp).offset == 10
+    assert not state.is_paused(tp)
+    assert state.is_fetchable(tp)
+    assert token not in state._pause_tokens
+    state.resume_pause_token(token)
+    clock.sleep(2)
+    assert not state.is_paused(tp)
 
 
 def test_type_error():

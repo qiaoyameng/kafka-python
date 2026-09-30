@@ -1050,6 +1050,40 @@ class KafkaConsumer:
             log.debug("Resuming partition %s", partition)
             self._subscription.resume(partition)
 
+    def pause_with_reason(self, *partitions, reason, timeout_ms=None):
+        """Suspend fetching from partitions and return a reason token.
+
+        Unlike :meth:`pause`, several independent pause reasons can overlap.
+        Fetching resumes only when every active reason token has been
+        released or expired.
+
+        Arguments:
+            *partitions (TopicPartition): Partitions to pause.
+            reason: Application-defined non-empty pause reason.
+            timeout_ms (int, optional): Token lifetime in milliseconds.
+                When omitted, the pause remains active until explicitly
+                resumed.
+
+        Returns:
+            PauseToken: Pass this token to :meth:`resume_pause_token` or
+            :meth:`renew_pause_token`.
+        """
+        if not all([isinstance(p, TopicPartition) for p in partitions]):
+            raise TypeError('partitions must be TopicPartition namedtuples')
+        token = self._subscription.pause_with_reason(
+            *partitions, reason=reason, timeout_ms=timeout_ms)
+        for partition in partitions:
+            log.debug("Pausing partition %s with reason %s", partition, reason)
+        return token
+
+    def resume_pause_token(self, token):
+        """Release a pause previously created by :meth:`pause_with_reason`."""
+        self._subscription.resume_pause_token(token)
+
+    def renew_pause_token(self, token, timeout_ms=None):
+        """Renew an active reason token, replacing its prior deadline."""
+        return self._subscription.renew_pause_token(token, timeout_ms=timeout_ms)
+
     def seek(self, partition, offset):
         """Manually specify the fetch offset for a TopicPartition.
 
