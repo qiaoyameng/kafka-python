@@ -23,6 +23,7 @@ import struct
 
 from kafka.errors import CorruptRecordError, IllegalStateError, UnsupportedVersionError
 from kafka.record.abc import ABCRecords
+from kafka.record.parse_error import BatchParseError, ParseStage
 from kafka.record.legacy_records import LegacyRecordBatch, LegacyRecordBatchBuilder
 from kafka.record.default_records import DefaultRecordBatch, DefaultRecordBatchBuilder
 
@@ -36,7 +37,9 @@ class MemoryRecords(ABCRecords):
     # Minimum space requirements for Record V0
     MIN_SLICE = LOG_OVERHEAD + LegacyRecordBatch.RECORD_OVERHEAD_V0
 
-    __slots__ = ("_buffer", "_pos", "_next_slice", "_remaining_bytes")
+    __slots__ = ("_buffer", "_pos", "_next_slice", "_remaining_bytes",
+                 "_pending_error", "_current_start", "_current_end",
+                 "_last_delivered_bounds")
 
     def __init__(self, bytes_data):
         self._buffer = bytes_data
@@ -44,6 +47,10 @@ class MemoryRecords(ABCRecords):
         # We keep one slice ahead so `has_next` will return very fast
         self._next_slice = None
         self._remaining_bytes = None
+        self._pending_error = None
+        self._current_start = None
+        self._current_end = None
+        self._last_delivered_bounds = None
         self._cache_next()
 
     def size_in_bytes(self):
@@ -62,9 +69,29 @@ class MemoryRecords(ABCRecords):
             self._pos = pos
         return len(self._buffer) - self._remaining_bytes
 
+    def _raise_length_error(self, pos, remaining, length, reason):
+        base_offset = None
+        if remaining >= 8:
+            base_offset, = struct.unpack_from(">q", self._buffer, pos)
+        # The length header cannot be trusted, so there is no sound byte
+        # boundary to resume at. Mark every trailing byte invalid.
+        self._pending_error = BatchParseError(
+            "Invalid record batch length header at byte %s: %s "
+            "(length=%s)" % (pos, reason, length),
+            ParseStage.LENGTH,
+            base_offset=base_offset,
+            batch_start=pos,
+            batch_end=None,
+            boundary_reliable=False)
+        self._remaining_bytes = remaining
+        self._next_slice = None
+        self._current_start = pos
+        self._current_end = None
+
     # NOTE: we cache offsets here as kwargs for a bit more speed, as cPython
     # will use LOAD_FAST opcode in this case
-    def _cache_next(self, len_offset=LENGTH_OFFSET, log_overhead=LOG_OVERHEAD):
+    def _cache_next(self, len_offset=LENGTH_OFFSET, log_overhead=LOG_OVERHEAD,
+                    min_record_overhead=LegacyRecordBatch.RECORD_OVERHEAD_V0):
         buffer = self._buffer
         buffer_len = len(buffer)
         pos = self._pos
@@ -75,6 +102,7 @@ class MemoryRecords(ABCRecords):
             self._next_slice = None
             return
 
+        self._pending_error = None
         length, = struct.unpack_from(
             ">i", buffer, pos + len_offset)
 
@@ -85,28 +113,89 @@ class MemoryRecords(ABCRecords):
             self._next_slice = None
             return
 
+        if length < min_record_overhead:
+            # A negative or implausibly small length means the length header
+            # itself is corrupt. Do not guess where the real batch ends.
+            self._raise_length_error(
+                pos, remaining, length,
+                "length shorter than minimum record overhead (%s)"
+                % min_record_overhead)
+            return
+
         self._next_slice = memoryview(buffer)[pos: slice_end]
+        self._current_start = pos
+        self._current_end = slice_end
         self._pos = slice_end
 
     def has_next(self):
-        return self._next_slice is not None
+        return self._next_slice is not None or self._pending_error is not None
+
+    def last_batch_bounds(self):
+        """Byte range ``(start, end)`` of the batch most recently delivered.
+
+        Returns the byte bounds, relative to the fetch buffer, of the batch
+        returned by the last successful :meth:`next_batch` call (or of the
+        pending damaged-length candidate when :meth:`next_batch` raised a
+        :data:`ParseStage.LENGTH` error). ``end`` is ``None`` when the length
+        header itself was damaged and no reliable boundary exists.
+        """
+        return self._last_delivered_bounds
 
     # NOTE: same cache for LOAD_FAST as above
     def next_batch(self, _min_slice=MIN_SLICE,
                    _magic_offset=MAGIC_OFFSET):
+        if self._pending_error is not None:
+            error, self._pending_error = self._pending_error, None
+            self._last_delivered_bounds = (self._current_start, None)
+            raise error
         next_slice = self._next_slice
         if next_slice is None:
             return None
+        start, end = self._current_start, self._current_end
+        # From here on the candidate batch bounds are (start, end); any
+        # error raised while handling it may safely report these bounds.
+        self._last_delivered_bounds = (start, end)
         if len(next_slice) < _min_slice:
-            raise CorruptRecordError(
+            base_offset = None
+            if len(next_slice) >= 8:
+                base_offset, = struct.unpack_from(">q", next_slice, 0)
+            raise BatchParseError(
                 "Record size is less than the minimum record overhead "
-                "({})".format(_min_slice - self.LOG_OVERHEAD))
+                "(%s)" % (_min_slice - self.LOG_OVERHEAD,),
+                ParseStage.HEADER,
+                base_offset=base_offset,
+                batch_start=start,
+                batch_end=end,
+                boundary_reliable=True)
         self._cache_next()
         magic, = struct.unpack_from(">b", next_slice, _magic_offset)
-        if magic <= 1:
-            return LegacyRecordBatch(next_slice, magic)
-        else:
-            return DefaultRecordBatch(next_slice)
+        if magic not in (0, 1, 2):
+            base_offset, = struct.unpack_from(">q", next_slice, 0)
+            raise BatchParseError(
+                "Unsupported record magic byte %s" % magic,
+                ParseStage.HEADER,
+                base_offset=base_offset,
+                batch_start=start,
+                batch_end=end,
+                boundary_reliable=True)
+        try:
+            if magic <= 1:
+                return LegacyRecordBatch(next_slice, magic)
+            else:
+                return DefaultRecordBatch(next_slice)
+        except (struct.error, ValueError, IndexError) as err:
+            base_offset = None
+            try:
+                base_offset, = struct.unpack_from(">q", next_slice, 0)
+            except struct.error:
+                pass
+            raise BatchParseError(
+                "Failed to parse record batch header: %r" % (err,),
+                ParseStage.HEADER,
+                base_offset=base_offset,
+                batch_start=start,
+                batch_end=end,
+                boundary_reliable=True)
 
     def __iter__(self):
         return self

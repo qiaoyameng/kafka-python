@@ -53,6 +53,7 @@ from kafka.codec import (
 )
 import kafka.codec as codecs
 from kafka.errors import CorruptRecordError, UnsupportedCodecError
+from kafka.record.parse_error import BatchParseError, ParseStage
 
 
 class LegacyRecordBase:
@@ -188,29 +189,39 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
     def _decompress(self, key_offset):
         # Copy of `_read_key_value`, but uses memoryview
         pos = key_offset
-        key_size = struct.unpack_from(">i", self._buffer, pos)[0]
-        pos += self.KEY_LENGTH
-        if key_size != -1:
-            pos += key_size
-        value_size = struct.unpack_from(">i", self._buffer, pos)[0]
-        pos += self.VALUE_LENGTH
-        if value_size == -1:
-            raise CorruptRecordError("Value of compressed message is None")
-        else:
-            data = self._buffer[pos:pos + value_size]
-
-        compression_type = self.compression_type
-        self._assert_has_codec(compression_type)
-        if compression_type == self.CODEC_GZIP:
-            uncompressed = gzip_decode(data)
-        elif compression_type == self.CODEC_SNAPPY:
-            uncompressed = snappy_decode(data.tobytes())
-        elif compression_type == self.CODEC_LZ4:
-            if self._magic == 0:
-                uncompressed = lz4_decode_old_kafka(data.tobytes())
+        try:
+            key_size = struct.unpack_from(">i", self._buffer, pos)[0]
+            pos += self.KEY_LENGTH
+            if key_size != -1:
+                pos += key_size
+            value_size = struct.unpack_from(">i", self._buffer, pos)[0]
+            pos += self.VALUE_LENGTH
+            if value_size == -1:
+                raise CorruptRecordError("Value of compressed message is None")
             else:
-                uncompressed = lz4_decode(data.tobytes())
-        return uncompressed  # pylint: disable=E0606
+                data = self._buffer[pos:pos + value_size]
+
+            compression_type = self.compression_type
+            self._assert_has_codec(compression_type)
+            if compression_type == self.CODEC_GZIP:
+                uncompressed = gzip_decode(data)
+            elif compression_type == self.CODEC_SNAPPY:
+                uncompressed = snappy_decode(data.tobytes())
+            elif compression_type == self.CODEC_LZ4:
+                if self._magic == 0:
+                    uncompressed = lz4_decode_old_kafka(data.tobytes())
+                else:
+                    uncompressed = lz4_decode(data.tobytes())
+            return uncompressed  # pylint: disable=E0606
+        except (BatchParseError, UnsupportedCodecError):
+            raise
+        except Exception as err:
+            raise BatchParseError(
+                "Failed to decompress legacy record batch payload "
+                "(compression=%s): %r" % (self.compression_type, err),
+                ParseStage.DECOMPRESS,
+                base_offset=self._offset,
+                boundary_reliable=True)
 
     def _read_header(self, pos):
         if self._magic == 0:
@@ -256,6 +267,23 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
             msg_pos + self.MAGIC_OFFSET:msg_pos + self.LOG_OVERHEAD + length]
 
     def __iter__(self):
+        try:
+            for record in self._iter_records():
+                yield record
+        except (BatchParseError, UnsupportedCodecError):
+            raise
+        except (AssertionError, ValueError, IndexError, struct.error) as err:
+            # The wrapper batch bounds are reliable (the length header was
+            # intact), but the records *inside* it cannot be walked. Report
+            # the wrapper base offset only -- inner record offsets are not
+            # recoverable and must not be invented.
+            raise BatchParseError(
+                "Failed to parse records inside legacy batch: %r" % (err,),
+                ParseStage.RECORDS,
+                base_offset=self._offset,
+                boundary_reliable=True)
+
+    def _iter_records(self):
         if self._magic == 1:
             key_offset = self.KEY_OFFSET_V1
         else:

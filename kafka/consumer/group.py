@@ -9,6 +9,8 @@ import kafka.errors as Errors
 from kafka.errors import KafkaConfigurationError, UnsupportedVersionError
 
 from kafka.consumer.fetcher import Fetcher
+from kafka.record.parse_error import (
+    CorruptBatchDecision, default_corrupt_batch_handler)
 from kafka.consumer.subscription_state import SubscriptionState
 from kafka.coordinator.consumer import ConsumerCoordinator
 from kafka.coordinator.assignors.range import RangePartitionAssignor
@@ -152,6 +154,16 @@ class KafkaConsumer:
             consumed. This ensures no on-the-wire or on-disk corruption to
             the messages occurred. This check adds some overhead, so it may
             be disabled in cases seeking extreme performance. Default: True
+        corrupt_batch_handler (callable): Quarantine decision for a record
+            batch that cannot be parsed. Called with a single
+            :class:`kafka.record.parse_error.BatchParseError` carrying the
+            topic, partition, base offset, byte bounds and failure stage.
+            Return :attr:`kafka.record.parse_error.CorruptBatchDecision.FAIL`
+            to raise the error (default) or
+            :attr:`kafka.record.parse_error.CorruptBatchDecision.SKIP_BATCH`
+            to drop the whole batch and continue. Skip is honored only when
+            the batch bounds are reliable; a corrupt length header always
+            fails because the resume point cannot be determined safely.
         isolation_level (str): Configure KIP-98 transactional consumer by
             setting to 'read_committed'. This will cause the consumer to
             skip records from aborted transactions. Default: 'read_uncommitted'
@@ -346,6 +358,7 @@ class KafkaConsumer:
         'auto_commit_interval_ms': 5000,
         'default_offset_commit_callback': lambda offsets, response: True,
         'check_crcs': True,
+        'corrupt_batch_handler': default_corrupt_batch_handler,
         'isolation_level': 'read_uncommitted',
         'allow_auto_create_topics': True,
         'metadata_max_age_ms': 5 * 60 * 1000,

@@ -15,6 +15,9 @@ from kafka.protocol.consumer import (
     OffsetSpec, UNKNOWN_OFFSET, IsolationLevel,
 )
 from kafka.record import MemoryRecords
+from kafka.record.parse_error import (
+    BatchParseError, CorruptBatchDecision, ParseStage,
+    default_corrupt_batch_handler)
 from kafka.serializer import Deserializer, DeserializeWrapper
 from kafka.structs import TopicPartition, OffsetAndMetadata, OffsetAndTimestamp
 from kafka.util import Timer
@@ -80,6 +83,11 @@ class RecordTooLargeError(Errors.KafkaError):
     pass
 
 
+# Sentinel returned by PartitionRecords._next_batch when the quarantine
+# handler decided to drop a corrupt but well-delimited batch.
+_SKIP = object()
+
+
 class Fetcher:
     DEFAULT_CONFIG = {
         'key_deserializer': None,
@@ -90,6 +98,7 @@ class Fetcher:
         'max_partition_fetch_bytes': 1048576,
         'max_poll_records': sys.maxsize,
         'check_crcs': True,
+        'corrupt_batch_handler': default_corrupt_batch_handler,
         'metrics': None,
         'metric_group_prefix': 'consumer',
         'request_timeout_ms': 30000,
@@ -141,6 +150,15 @@ class Fetcher:
                 consumed. This ensures no on-the-wire or on-disk corruption to
                 the messages occurred. This check adds some overhead, so it may
                 be disabled in cases seeking extreme performance. Default: True
+            corrupt_batch_handler (callable): Quarantine decision invoked when
+                a record batch cannot be parsed (bad CRC, undecodable
+                compressed body, malformed batch header). Called with a single
+                :class:`kafka.record.parse_error.BatchParseError` argument and
+                must return :attr:`CorruptBatchDecision.FAIL` (default, raises
+                the error) or :attr:`CorruptBatchDecision.SKIP_BATCH` (drop
+                the whole batch and continue). SKIP_BATCH is honored only when
+                the batch's byte boundaries are reliable; a damaged length
+                header always fails because there is no safe place to resume.
             isolation_level (str): Configure KIP-98 transactional consumer by
                 setting to 'read_committed'. This will cause the consumer to
                 skip records from aborted tranactions. Default: 'read_uncommitted'
@@ -149,6 +167,10 @@ class Fetcher:
         for key in self.config:
             if key in configs:
                 self.config[key] = configs[key]
+
+        if not callable(self.config['corrupt_batch_handler']):
+            raise Errors.KafkaConfigurationError(
+                'corrupt_batch_handler must be callable')
 
         for key in ('key_deserializer', 'value_deserializer'):
             if self.config[key] is not None and not isinstance(self.config[key], Deserializer):
@@ -1469,6 +1491,7 @@ class Fetcher:
                                                        key_deserializer=self.config['key_deserializer'],
                                                        value_deserializer=self.config['value_deserializer'],
                                                        check_crcs=self.config['check_crcs'],
+                                                       corrupt_batch_handler=self.config['corrupt_batch_handler'],
                                                        isolation_level=self._isolation_level,
                                                        aborted_transactions=aborted_transactions,
                                                        metric_aggregator=completed_fetch.metric_aggregator,
@@ -1597,6 +1620,7 @@ class Fetcher:
         def __init__(self, fetch_offset, tp, records,
                      key_deserializer=None, value_deserializer=None,
                      check_crcs=True,
+                     corrupt_batch_handler=default_corrupt_batch_handler,
                      isolation_level=IsolationLevel.READ_UNCOMMITTED,
                      aborted_transactions=None, # AbortedTransaction data from FetchResponse
                      metric_aggregator=None, on_drain=lambda x: None):
@@ -1613,6 +1637,8 @@ class Fetcher:
             )
             self.metric_aggregator = metric_aggregator
             self.check_crcs = check_crcs
+            self.corrupt_batch_handler = corrupt_batch_handler
+            self.batches_skipped_corrupt = 0
             self.record_iterator = itertools.dropwhile(
                 self._maybe_skip_record,
                 self._unpack_records(tp, records, key_deserializer, value_deserializer))
@@ -1661,78 +1687,169 @@ class Fetcher:
                 self._next_inline_exception = e
             return records
 
+        def _enrich_parse_error(self, tp, records, error, batch=None):
+            """Attach fetch-layer location to a record-layer BatchParseError."""
+            start, end = records.last_batch_bounds()
+            if error.batch_start is None:
+                error.batch_start = start
+            if error.batch_end is None and end is not None:
+                error.batch_end = end
+                if error.boundary_reliable is False and start is not None and end is not None:
+                    error.boundary_reliable = True
+            error.topic = tp.topic
+            error.partition = tp.partition
+            if error.base_offset is None and batch is not None:
+                error.base_offset = batch.base_offset
+            return error
+
+        def _quarantine_or_raise(self, tp, records, error, batch=None):
+            """Apply the quarantine decision to an unparseable batch.
+
+            Returns True if the whole, well-delimited batch may be skipped;
+            raises the (enriched) BatchParseError otherwise. A damaged length
+            header always raises -- there is no reliable boundary to skip to.
+            """
+            self._enrich_parse_error(tp, records, error, batch)
+            decision = self.corrupt_batch_handler(error)
+            if decision == CorruptBatchDecision.SKIP_BATCH and error.skippable:
+                log.warning(
+                    "Skipping corrupt record batch for %s base_offset=%s "
+                    "bytes[%s:%s] stage=%s as requested by corrupt_batch_handler",
+                    self.topic_partition, error.base_offset,
+                    error.batch_start, error.batch_end, error.stage)
+                self.batches_skipped_corrupt += 1
+                return True
+            if decision not in (CorruptBatchDecision.FAIL,
+                                CorruptBatchDecision.SKIP_BATCH):
+                raise Errors.KafkaConfigurationError(
+                    "corrupt_batch_handler returned an invalid decision: %r"
+                    % (decision,))
+            if decision == CorruptBatchDecision.SKIP_BATCH:
+                # Requested skip, but the batch boundary cannot be trusted
+                # (typically a damaged length header). Guessing where to
+                # resume would silently corrupt the stream; fail instead.
+                log.error(
+                    "Cannot skip corrupt batch for %s stage=%s: batch "
+                    "boundary is not reliable, failing as required",
+                    self.topic_partition, error.stage)
+            raise error
+
+        def _next_batch(self, tp, records):
+            """Fetch the next batch, converting framing errors to skip/raise."""
+            try:
+                return records.next_batch()
+            except BatchParseError as error:
+                if self._quarantine_or_raise(tp, records, error):
+                    return _SKIP
+                raise
+
         def _unpack_records(self, tp, records, key_deserializer, value_deserializer):
             try:
-                batch = records.next_batch()
+                batch = self._next_batch(tp, records)
                 last_batch = None
                 while batch is not None:
-                    last_batch = batch
+                    if batch is _SKIP:
+                        batch = self._next_batch(tp, records)
+                        continue
 
-                    if self.check_crcs and not batch.validate_crc():
-                        raise Errors.CorruptRecordError(
-                                "Record batch for partition %s at offset %s failed crc check" % (
-                                    self.topic_partition, batch.base_offset))
+                    try:
+                        last_batch = batch
+                        if self.check_crcs and not batch.validate_crc():
+                            start, end = records.last_batch_bounds()
+                            raise BatchParseError(
+                                "Record batch for partition %s at offset %s "
+                                "failed crc check" % (
+                                    self.topic_partition, batch.base_offset),
+                                ParseStage.CRC,
+                                base_offset=batch.base_offset,
+                                batch_start=start,
+                                batch_end=end,
+                                boundary_reliable=True)
 
+                        # Try DefaultsRecordBatch / message log format v2
+                        # base_offset, last_offset_delta, aborted transactions, and control batches
+                        if batch.magic == 2:
+                            self.leader_epoch = batch.leader_epoch
+                            if self.isolation_level == IsolationLevel.READ_COMMITTED and batch.has_producer_id():
+                                # remove from the aborted transaction queue all aborted transactions which have begun
+                                # before the current batch's last offset and add the associated producerIds to the
+                                # aborted producer set
+                                self._consume_aborted_transactions_up_to(batch.last_offset)
 
-                    # Try DefaultsRecordBatch / message log format v2
-                    # base_offset, last_offset_delta, aborted transactions, and control batches
-                    if batch.magic == 2:
-                        self.leader_epoch = batch.leader_epoch
-                        if self.isolation_level == IsolationLevel.READ_COMMITTED and batch.has_producer_id():
-                            # remove from the aborted transaction queue all aborted transactions which have begun
-                            # before the current batch's last offset and add the associated producerIds to the
-                            # aborted producer set
-                            self._consume_aborted_transactions_up_to(batch.last_offset)
+                                producer_id = batch.producer_id
+                                if self._contains_abort_marker(batch):
+                                    try:
+                                        self.aborted_producer_ids.remove(producer_id)
+                                    except KeyError:
+                                        pass
+                                elif self._is_batch_aborted(batch):
+                                    log.debug("Skipping aborted record batch from partition %s with producer_id %s and"
+                                              " offsets %s to %s",
+                                              self.topic_partition, producer_id, batch.base_offset, batch.last_offset)
+                                    self.next_fetch_offset = batch.next_offset
+                                    batch = self._next_batch(tp, records)
+                                    continue
 
-                            producer_id = batch.producer_id
-                            if self._contains_abort_marker(batch):
-                                try:
-                                    self.aborted_producer_ids.remove(producer_id)
-                                except KeyError:
-                                    pass
-                            elif self._is_batch_aborted(batch):
-                                log.debug("Skipping aborted record batch from partition %s with producer_id %s and"
-                                          " offsets %s to %s",
-                                          self.topic_partition, producer_id, batch.base_offset, batch.last_offset)
+                            # Control batches have a single record indicating whether a transaction
+                            # was aborted or committed. These are not returned to the consumer.
+                            if batch.is_control_batch:
                                 self.next_fetch_offset = batch.next_offset
-                                batch = records.next_batch()
+                                batch = self._next_batch(tp, records)
                                 continue
 
-                        # Control batches have a single record indicating whether a transaction
-                        # was aborted or committed. These are not returned to the consumer.
-                        if batch.is_control_batch:
-                            self.next_fetch_offset = batch.next_offset
-                            batch = records.next_batch()
+                        for record in batch:
+                            if self.check_crcs and not record.validate_crc():
+                                start, end = records.last_batch_bounds()
+                                # Inner-record CRC failure. We deliberately do
+                                # NOT report this inner record's offset as the
+                                # batch base; skip is whole-batch and the
+                                # wrapper bounds are what is reliable.
+                                raise BatchParseError(
+                                    "Record inside batch for partition %s "
+                                    "(batch base_offset %s, record offset %s) "
+                                    "failed crc check" % (
+                                        self.topic_partition, batch.base_offset,
+                                        record.offset),
+                                    ParseStage.CRC,
+                                    base_offset=batch.base_offset,
+                                    batch_start=start,
+                                    batch_end=end,
+                                    boundary_reliable=True)
+                            key_size = len(record.key) if record.key is not None else -1
+                            value_size = len(record.value) if record.value is not None else -1
+                            key = self._deserialize(key_deserializer, tp.topic, record.headers, record.key)
+                            value = self._deserialize(value_deserializer, tp.topic, record.headers, record.value)
+                            headers = record.headers
+                            header_size = sum(
+                                len(h_key.encode("utf-8")) + (len(h_val) if h_val is not None else 0) for h_key, h_val in
+                                headers) if headers else -1
+                            self.records_read += 1
+                            self.bytes_read += record.size_in_bytes
+                            self.next_fetch_offset = record.offset + 1
+                            yield ConsumerRecord(
+                                tp.topic, tp.partition, self.leader_epoch, record.offset, record.timestamp,
+                                record.timestamp_type, key, value, record.headers, record.checksum,
+                                key_size, value_size, header_size)
+
+                    except BatchParseError as error:
+                        if self._quarantine_or_raise(tp, records, error, batch):
+                            # Skip the entire well-delimited batch. Do not
+                            # advance next_fetch_offset from any header inside
+                            # the unreadable batch; a later good batch in this
+                            # response will set it from a verified record.
+                            batch = self._next_batch(tp, records)
                             continue
+                        raise
 
-                    for record in batch:
-                        if self.check_crcs and not record.validate_crc():
-                            raise Errors.CorruptRecordError(
-                                    "Record for partition %s at offset %s failed crc check" % (
-                                        self.topic_partition, record.offset))
-                        key_size = len(record.key) if record.key is not None else -1
-                        value_size = len(record.value) if record.value is not None else -1
-                        key = self._deserialize(key_deserializer, tp.topic, record.headers, record.key)
-                        value = self._deserialize(value_deserializer, tp.topic, record.headers, record.value)
-                        headers = record.headers
-                        header_size = sum(
-                            len(h_key.encode("utf-8")) + (len(h_val) if h_val is not None else 0) for h_key, h_val in
-                            headers) if headers else -1
-                        self.records_read += 1
-                        self.bytes_read += record.size_in_bytes
-                        self.next_fetch_offset = record.offset + 1
-                        yield ConsumerRecord(
-                            tp.topic, tp.partition, self.leader_epoch, record.offset, record.timestamp,
-                            record.timestamp_type, key, value, record.headers, record.checksum,
-                            key_size, value_size, header_size)
-
-                    batch = records.next_batch()
-                else:
                     # Message format v2 preserves the last offset in a batch even if the last record is removed
                     # through compaction. By using the next offset computed from the last offset in the batch,
                     # we ensure that the offset of the next fetch will point to the next batch, which avoids
                     # unnecessary re-fetching of the same batch (in the worst case, the consumer could get stuck
                     # fetching the same batch repeatedly).
+                    if batch.magic == 2:
+                        self.next_fetch_offset = batch.next_offset
+                    batch = self._next_batch(tp, records)
+                else:
                     if last_batch and last_batch.magic == 2:
                         self.next_fetch_offset = last_batch.next_offset
                     self.drain()

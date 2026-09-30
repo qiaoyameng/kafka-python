@@ -61,6 +61,7 @@ from kafka.record.util import (
     decode_varint, encode_varint, calc_crc32c, size_of_varint
 )
 from kafka.errors import CorruptRecordError, UnsupportedCodecError
+from kafka.record.parse_error import BatchParseError, ParseStage
 from kafka.codec import (
     gzip_encode, snappy_encode, lz4_encode, zstd_encode,
     gzip_decode, snappy_decode, lz4_decode, zstd_decode
@@ -237,14 +238,26 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
             if compression_type != self.CODEC_NONE:
                 self._assert_has_codec(compression_type)
                 data = memoryview(self._buffer)[self._pos:]
-                if compression_type == self.CODEC_GZIP:
-                    uncompressed = gzip_decode(data)
-                if compression_type == self.CODEC_SNAPPY:
-                    uncompressed = snappy_decode(data.tobytes())
-                if compression_type == self.CODEC_LZ4:
-                    uncompressed = lz4_decode(data.tobytes())
-                if compression_type == self.CODEC_ZSTD:
-                    uncompressed = zstd_decode(data.tobytes())
+                try:
+                    if compression_type == self.CODEC_GZIP:
+                        uncompressed = gzip_decode(data)
+                    if compression_type == self.CODEC_SNAPPY:
+                        uncompressed = snappy_decode(data.tobytes())
+                    if compression_type == self.CODEC_LZ4:
+                        uncompressed = lz4_decode(data.tobytes())
+                    if compression_type == self.CODEC_ZSTD:
+                        uncompressed = zstd_decode(data.tobytes())
+                except Exception as err:
+                    # CRC passed (or was not checked), the batch bounds are
+                    # reliable, but the compressed body itself is garbage.
+                    if isinstance(err, UnsupportedCodecError):
+                        raise
+                    raise BatchParseError(
+                        "Failed to decompress record batch payload "
+                        "(compression=%s): %r" % (compression_type, err),
+                        ParseStage.DECOMPRESS,
+                        base_offset=self.base_offset,
+                        boundary_reliable=True)
                 self._buffer = bytearray(uncompressed)  # pylint: disable=E0606
                 self._pos = 0
         self._decompressed = True
@@ -294,15 +307,21 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
 
         header_count, pos = decode_varint(buffer, pos)
         if header_count < 0:
-            raise CorruptRecordError("Found invalid number of record "
-                                         "headers {}".format(header_count))
+            raise BatchParseError(
+                "Found invalid number of record headers {}".format(header_count),
+                ParseStage.RECORDS,
+                base_offset=self.base_offset,
+                boundary_reliable=True)
         headers = []
         while header_count:
             # Header key is of type String, that can't be None
             h_key_len, pos = decode_varint(buffer, pos)
             if h_key_len < 0:
-                raise CorruptRecordError(
-                    "Invalid negative header key size {}".format(h_key_len))
+                raise BatchParseError(
+                    "Invalid negative header key size {}".format(h_key_len),
+                    ParseStage.RECORDS,
+                    base_offset=self.base_offset,
+                    boundary_reliable=True)
             h_key = buffer[pos: pos + h_key_len].decode("utf-8")
             pos += h_key_len
 
@@ -319,9 +338,12 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
 
         # validate whether we have read all header bytes in the current record
         if pos - start_pos != length:
-            raise CorruptRecordError(
+            raise BatchParseError(
                 "Invalid record size: expected to read {} bytes in record "
-                "payload, but instead read {}".format(length, pos - start_pos))
+                "payload, but instead read {}".format(length, pos - start_pos),
+                ParseStage.RECORDS,
+                base_offset=self.base_offset,
+                boundary_reliable=True)
         self._pos = pos
 
         if self.is_control_batch:
@@ -338,15 +360,23 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
     def __next__(self):
         if self._next_record_index >= self._num_records:
             if self._pos != len(self._buffer):
-                raise CorruptRecordError(
+                raise BatchParseError(
                     "{} unconsumed bytes after all records consumed".format(
-                        len(self._buffer) - self._pos))
+                        len(self._buffer) - self._pos),
+                    ParseStage.RECORDS,
+                    base_offset=self.base_offset,
+                    boundary_reliable=True)
             raise StopIteration
         try:
             msg = self._read_msg()
+        except BatchParseError:
+            raise
         except (ValueError, IndexError) as err:
-            raise CorruptRecordError(
-                "Found invalid record structure: {!r}".format(err))
+            raise BatchParseError(
+                "Found invalid record structure: {!r}".format(err),
+                ParseStage.RECORDS,
+                base_offset=self.base_offset,
+                boundary_reliable=True)
         else:
             self._next_record_index += 1
         return msg

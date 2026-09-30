@@ -1,3 +1,15 @@
+# Unreleased
+
+### Features
+* consumer: raise structured `kafka.record.parse_error.BatchParseError`
+  (subclass of `CorruptRecordError`) for corrupt record batches, carrying
+  topic, partition, base offset, byte bounds and failure stage
+  (length/header/crc/decompress/records). Add the `corrupt_batch_handler`
+  config to explicitly quarantine (fail by default) or skip a whole batch
+  whose boundaries are reliably known; a corrupt length header always fails
+  because no safe resume point exists. Offsets of records inside an
+  unreadable batch are never invented.
+
 # 3.0.7 (Jun 28, 2026)
 
 ### Fixes
