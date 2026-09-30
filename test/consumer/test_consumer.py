@@ -89,6 +89,66 @@ def test_assign():
     consumer.close()
 
 
+def test_pause_with_reason_double_pause():
+    tp = TopicPartition('foo', 0)
+    consumer = KafkaConsumer(api_version=(0, 10, 0))
+    consumer.assign([tp])
+
+    consumer.pause_with_reason(tp, reason='rate-limit')
+    consumer.pause_with_reason(tp, reason='maintenance')
+    assert consumer.paused() == {tp}
+    assert consumer.pause_reasons(tp) == frozenset({'rate-limit', 'maintenance'})
+
+    # Lifting one reason keeps the partition paused.
+    consumer.resume_with_reason(tp, reason='rate-limit')
+    assert consumer.paused() == {tp}
+    assert consumer.pause_reasons(tp) == frozenset({'maintenance'})
+
+    consumer.resume_with_reason(tp, reason='maintenance')
+    assert consumer.paused() == set()
+    assert consumer.pause_reasons(tp) == frozenset()
+    consumer.close()
+
+
+def test_pause_with_reason_legacy_isolation():
+    tp = TopicPartition('foo', 0)
+    consumer = KafkaConsumer(api_version=(0, 10, 0))
+    consumer.assign([tp])
+
+    # Legacy resume() must not lift a reason-token pause.
+    consumer.pause_with_reason(tp, reason='maintenance')
+    consumer.pause(tp)
+    consumer.resume(tp)
+    assert consumer.paused() == {tp}
+    assert consumer.pause_reasons(tp) == frozenset({'maintenance'})
+
+    # And a reason resume must not lift the legacy pause.
+    consumer.pause(tp)
+    consumer.resume_with_reason(tp, reason='maintenance')
+    assert consumer.paused() == {tp}
+    assert consumer.pause_reasons(tp) == frozenset()
+    consumer.resume(tp)
+    assert consumer.paused() == set()
+    consumer.close()
+
+
+def test_pause_with_reason_validation():
+    tp = TopicPartition('foo', 0)
+    consumer = KafkaConsumer(api_version=(0, 10, 0))
+    consumer.assign([tp])
+    with pytest.raises(TypeError):
+        consumer.pause_with_reason('foo', reason='x')
+    with pytest.raises(TypeError):
+        consumer.pause_with_reason(tp, reason=None)
+    with pytest.raises(ValueError):
+        consumer.pause_with_reason(tp, reason='')
+    with pytest.raises(ValueError):
+        consumer.pause_with_reason(tp, reason='x', timeout_ms=0)
+    with pytest.raises(TypeError):
+        consumer.pause_reasons('foo')
+    consumer.close()
+
+
 def test_context_manager_closes_on_exit():
     with KafkaConsumer(api_version=(0, 10, 0)) as consumer:
         assert consumer._closed is False

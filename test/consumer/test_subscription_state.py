@@ -1,10 +1,32 @@
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from kafka import TopicPartition
 from kafka.consumer.subscription_state import SubscriptionState, TopicPartitionState
 from kafka.structs import OffsetAndMetadata
+
+
+class FakeClock:
+    """Deterministic monotonic clock for pause-token expiry tests."""
+
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_clock(mocker):
+    clock = FakeClock()
+    mocker.patch('kafka.consumer.subscription_state.time',
+                 SimpleNamespace(monotonic=clock.monotonic))
+    return clock
 
 
 def test_type_error():
@@ -256,3 +278,187 @@ class TestAssignFromSubscribed:
 
         assert s.assignment[TopicPartition('foo', 0)].position.offset == 50
         assert s.is_paused(TopicPartition('foo', 1))
+
+
+# ---------------------------------------------------------------------------
+# Reason-token pauses: pause_with_reason / resume_with_reason
+# ---------------------------------------------------------------------------
+
+
+class TestPauseWithReason:
+    TP = TopicPartition('foo', 0)
+
+    def _state(self):
+        s = SubscriptionState()
+        s.assign_from_user([self.TP])
+        s.seek(self.TP, 0)
+        return s
+
+    def test_double_pause_requires_all_tokens_resumed(self):
+        """Two independent pauses (rate-limit + maintenance): lifting one
+        must not resume fetching while the other is still active."""
+        s = self._state()
+        s.pause_with_reason(self.TP, 'rate-limit')
+        s.pause_with_reason(self.TP, 'maintenance')
+        assert s.is_paused(self.TP)
+        assert not s.is_fetchable(self.TP)
+        assert s.paused_partitions() == {self.TP}
+
+        s.resume_with_reason(self.TP, 'rate-limit')
+        assert s.is_paused(self.TP)
+        assert not s.is_fetchable(self.TP)
+        assert s.paused_partitions() == {self.TP}
+        assert s.pause_reasons(self.TP) == frozenset({'maintenance'})
+
+        s.resume_with_reason(self.TP, 'maintenance')
+        assert not s.is_paused(self.TP)
+        assert s.is_fetchable(self.TP)
+        assert s.paused_partitions() == set()
+        assert s.pause_reasons(self.TP) == frozenset()
+
+    def test_legacy_pause_resume_roundtrip_unchanged(self):
+        """Pure legacy pause()/resume() keeps its pre-token semantics."""
+        s = self._state()
+        s.pause(self.TP)
+        assert s.is_paused(self.TP)
+        assert not s.is_fetchable(self.TP)
+        s.resume(self.TP)
+        assert not s.is_paused(self.TP)
+        assert s.is_fetchable(self.TP)
+
+    def test_legacy_resume_does_not_lift_reason_pause(self):
+        s = self._state()
+        s.pause(self.TP)
+        s.pause_with_reason(self.TP, 'maintenance')
+        s.resume(self.TP)
+        assert s.is_paused(self.TP)
+        assert not s.is_fetchable(self.TP)
+        assert s.pause_reasons(self.TP) == frozenset({'maintenance'})
+        s.resume_with_reason(self.TP, 'maintenance')
+        assert not s.is_paused(self.TP)
+
+    def test_reason_resume_does_not_lift_legacy_pause(self):
+        s = self._state()
+        s.pause(self.TP)
+        s.pause_with_reason(self.TP, 'rate-limit')
+        s.resume_with_reason(self.TP, 'rate-limit')
+        assert s.is_paused(self.TP)
+        assert not s.is_fetchable(self.TP)
+        s.resume(self.TP)
+        assert not s.is_paused(self.TP)
+
+    def test_legacy_pause_not_reported_as_reason(self):
+        s = self._state()
+        s.pause(self.TP)
+        assert s.is_paused(self.TP)
+        assert s.pause_reasons(self.TP) == frozenset()
+
+    def test_resume_unknown_reason_is_noop(self):
+        s = self._state()
+        s.pause_with_reason(self.TP, 'maintenance')
+        s.resume_with_reason(self.TP, 'rate-limit')
+        assert s.is_paused(self.TP)
+        assert s.pause_reasons(self.TP) == frozenset({'maintenance'})
+
+    def test_token_expires_on_monotonic_clock(self, fake_clock):
+        s = self._state()
+        s.pause_with_reason(self.TP, 'rate-limit', timeout_ms=1000)
+        assert s.is_paused(self.TP)
+
+        fake_clock.advance(0.5)
+        assert s.is_paused(self.TP)
+        assert not s.is_fetchable(self.TP)
+        assert s.paused_partitions() == {self.TP}
+
+        fake_clock.advance(0.6)
+        assert not s.is_paused(self.TP)
+        assert s.is_fetchable(self.TP)
+        assert s.paused_partitions() == set()
+        assert s.pause_reasons(self.TP) == frozenset()
+
+    def test_expired_token_does_not_lift_other_tokens(self, fake_clock):
+        s = self._state()
+        s.pause_with_reason(self.TP, 'rate-limit', timeout_ms=1000)
+        s.pause_with_reason(self.TP, 'maintenance')
+        fake_clock.advance(2.0)
+        # The timed token expired, but the indefinite one still holds.
+        assert s.is_paused(self.TP)
+        assert not s.is_fetchable(self.TP)
+        assert s.pause_reasons(self.TP) == frozenset({'maintenance'})
+
+    def test_renewal_not_lifted_by_previous_deadline(self, fake_clock):
+        """Re-pausing the same reason replaces its deadline; the earlier
+        deadline must not expire the renewed token."""
+        s = self._state()
+        s.pause_with_reason(self.TP, 'rate-limit', timeout_ms=1000)
+        fake_clock.advance(0.9)
+        # Manual renewal just before the original deadline.
+        s.pause_with_reason(self.TP, 'rate-limit', timeout_ms=1000)
+
+        fake_clock.advance(0.2)  # t=1.1: original deadline (t=1.0) passed
+        assert s.is_paused(self.TP)
+        assert not s.is_fetchable(self.TP)
+
+        fake_clock.advance(0.9)  # t=2.0: renewed deadline (t=1.9) passed
+        assert not s.is_paused(self.TP)
+        assert s.is_fetchable(self.TP)
+
+    def test_renewal_can_remove_expiry(self, fake_clock):
+        s = self._state()
+        s.pause_with_reason(self.TP, 'rate-limit', timeout_ms=1000)
+        s.pause_with_reason(self.TP, 'rate-limit')  # renew without timeout
+        fake_clock.advance(60.0)
+        assert s.is_paused(self.TP)
+
+    def test_tokens_dropped_when_partition_revoked(self, fake_clock):
+        """Rebalance: tokens of a revoked partition must not affect its
+        next owner - a fresh assignment starts unpaused."""
+        s = SubscriptionState()
+        s.subscribe(topics=['foo'])
+        s.assign_from_subscribed([self.TP])
+        s.seek(self.TP, 0)
+        s.pause_with_reason(self.TP, 'maintenance')
+        s.pause_with_reason(self.TP, 'rate-limit', timeout_ms=60 * 1000)
+        assert s.is_paused(self.TP)
+
+        # Revoked entirely, then re-assigned (new owner): fresh state.
+        s.assign_from_subscribed([])
+        assert not s.is_assigned(self.TP)
+        s.assign_from_subscribed([self.TP])
+        assert not s.is_paused(self.TP)
+        assert s.pause_reasons(self.TP) == frozenset()
+        s.seek(self.TP, 0)
+        assert s.is_fetchable(self.TP)
+
+    def test_tokens_kept_for_retained_partition(self):
+        """A partition that stays assigned across a rebalance keeps its
+        tokens (same owner)."""
+        s = SubscriptionState()
+        s.subscribe(topics=['foo'])
+        s.assign_from_subscribed([self.TP, TopicPartition('foo', 1)])
+        s.pause_with_reason(self.TP, 'maintenance')
+        s.assign_from_subscribed([self.TP])
+        assert s.is_paused(self.TP)
+        assert s.pause_reasons(self.TP) == frozenset({'maintenance'})
+
+    def test_pause_reasons_unassigned_partition(self):
+        s = SubscriptionState()
+        assert s.pause_reasons(self.TP) == frozenset()
+
+    def test_reason_validation(self):
+        s = self._state()
+        with pytest.raises(TypeError):
+            s.pause_with_reason(self.TP, None)
+        with pytest.raises(TypeError):
+            s.pause_with_reason(self.TP, 42)
+        with pytest.raises(ValueError):
+            s.pause_with_reason(self.TP, '')
+        with pytest.raises(TypeError):
+            s.resume_with_reason(self.TP, None)
+
+    def test_timeout_validation(self):
+        s = self._state()
+        with pytest.raises(ValueError):
+            s.pause_with_reason(self.TP, 'rate-limit', timeout_ms=0)
+        with pytest.raises(ValueError):
+            s.pause_with_reason(self.TP, 'rate-limit', timeout_ms=-5)

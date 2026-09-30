@@ -16,6 +16,9 @@ from kafka.util import ensure_valid_topic_name, synchronized
 log = logging.getLogger(__name__)
 
 
+_LEGACY_PAUSE_REASON = object()
+
+
 class SubscriptionType(IntEnum):
     NONE = 0
     AUTO_TOPICS = 1
@@ -38,6 +41,16 @@ class SubscriptionState:
     fetched/consumed offsets. The partition will remain unfetchable until the
     resume() is used. You can also query the pause state independently with
     is_paused().
+
+    Pauses are tracked as a set of reason tokens per partition: a partition
+    stays paused while at least one unexpired token remains, so independent
+    subsystems (e.g. downstream rate-limiting vs manual maintenance) can
+    pause the same partition without a simple resume() lifting the other's
+    pause. pause_with_reason() adds a token (optionally with a timeout,
+    evaluated against the monotonic clock) and resume_with_reason() removes
+    exactly that token. The legacy pause()/resume() pair operates on its own
+    reserved token: pause() then resume() behaves exactly as before, but
+    resume() never lifts reason-token pauses (and vice versa).
 
     Note that pause state as well as fetch/consumed positions are not preserved
     when partition assignment is changed whether directly by the user or
@@ -519,6 +532,37 @@ class SubscriptionState:
         self.assignment[partition].resume()
 
     @synchronized
+    def pause_with_reason(self, partition, reason, timeout_ms=None):
+        """Pause a partition under a named reason token.
+
+        The partition stays paused until every active token is removed
+        (resume_with_reason()) or expires (timeout_ms, monotonic clock).
+        Re-pausing with the same reason renews/replaces its deadline.
+
+        Arguments:
+            partition (TopicPartition): partition to pause
+            reason (str): non-empty token identifying the pause cause
+            timeout_ms (int, optional): pause auto-expires after this many
+                milliseconds; None (default) pauses indefinitely
+        """
+        self.assignment[partition].pause_with_reason(reason, timeout_ms=timeout_ms)
+
+    @synchronized
+    def resume_with_reason(self, partition, reason):
+        """Remove a single reason token from a partition. The partition
+        resumes only when no other active tokens remain."""
+        self.assignment[partition].resume_with_reason(reason)
+
+    @synchronized
+    def pause_reasons(self, partition):
+        """Return frozenset of active (unexpired) user-supplied pause
+        reasons for a partition. The reserved legacy pause()/resume()
+        token is not included."""
+        if partition not in self.assignment:
+            return frozenset()
+        return self.assignment[partition].pause_reasons()
+
+    @synchronized
     def mark_pending_revocation(self, partitions):
         """KIP-429: gate ``is_fetchable()`` for each partition's state
         so the fetcher would skip them while an on_partitions_revoked /
@@ -557,7 +601,14 @@ class SubscriptionState:
 
 class TopicPartitionState:
     def __init__(self):
-        self.paused = False # whether this partition has been paused by the user
+        # Pause tokens: reason -> monotonic expiration time (None = no
+        # expiry). The partition is paused while at least one unexpired
+        # token remains. Legacy pause()/resume() use the reserved
+        # _LEGACY_PAUSE_REASON token so they compose with reason-based
+        # pauses without clobbering them. Tokens live and die with this
+        # state object: a rebalance that revokes the partition drops the
+        # whole state, so stale tokens never leak to a new owner.
+        self._pause_tokens = {}
         self.reset_strategy = None # the reset strategy if awaiting_reset is set
         self._position = None # OffsetAndMetadata exposed to the user
         self.highwater = None
@@ -649,10 +700,59 @@ class TopicPartitionState:
         self.clear_preferred_read_replica()
 
     def pause(self):
-        self.paused = True
+        self._pause_tokens[_LEGACY_PAUSE_REASON] = None
 
     def resume(self):
-        self.paused = False
+        self._pause_tokens.pop(_LEGACY_PAUSE_REASON, None)
+
+    def pause_with_reason(self, reason, timeout_ms=None):
+        """Add a pause token for reason, optionally expiring after
+        timeout_ms (monotonic clock). Re-pausing with the same reason
+        replaces its deadline, so manual renewal is safe: expiry is
+        evaluated lazily against the current monotonic time and no stale
+        timer can lift the renewed pause early."""
+        if not isinstance(reason, str):
+            raise TypeError('reason must be a string')
+        if not reason:
+            raise ValueError('reason must be a non-empty string')
+        if timeout_ms is not None:
+            if timeout_ms <= 0:
+                raise ValueError('timeout_ms must be positive')
+            expires_at = time.monotonic() + timeout_ms / 1000.0
+        else:
+            expires_at = None
+        self._pause_tokens[reason] = expires_at
+
+    def resume_with_reason(self, reason):
+        """Remove the pause token for reason (no-op if absent)."""
+        if not isinstance(reason, str):
+            raise TypeError('reason must be a string')
+        self._pause_tokens.pop(reason, None)
+
+    def pause_reasons(self):
+        """Return frozenset of active (unexpired) user-supplied pause
+        reasons, excluding the reserved legacy pause()/resume() token."""
+        self._purge_expired_pause_tokens()
+        return frozenset(reason for reason in self._pause_tokens
+                         if reason is not _LEGACY_PAUSE_REASON)
+
+    def _purge_expired_pause_tokens(self):
+        expired = None
+        for reason, expires_at in self._pause_tokens.items():
+            if expires_at is not None and time.monotonic() >= expires_at:
+                if expired is None:
+                    expired = []
+                expired.append(reason)
+        if expired:
+            for reason in expired:
+                del self._pause_tokens[reason]
+
+    @property
+    def paused(self):
+        """Whether this partition is currently paused, i.e. has at least
+        one unexpired pause token. Expired tokens are purged lazily."""
+        self._purge_expired_pause_tokens()
+        return bool(self._pause_tokens)
 
     def mark_pending_revocation(self, val=True):
         """KIP-429: gate fetches while an on_partitions_revoked /

@@ -6,6 +6,7 @@ import pytest
 from collections import OrderedDict
 import itertools
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from kafka.consumer.fetcher import (
@@ -972,6 +973,177 @@ def test_close_drains_parked_paused_records(fetcher, topic):
     assert not fetcher._paused_completed_fetches
 
 
+# ---------------------------------------------------------------------------
+# Reason-token pauses (pause_with_reason / resume_with_reason)
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    """Deterministic monotonic clock for pause-token expiry tests."""
+
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+@pytest.fixture
+def fake_clock(mocker):
+    clock = FakeClock()
+    mocker.patch('kafka.consumer.subscription_state.time',
+                 SimpleNamespace(monotonic=clock.monotonic))
+    return clock
+
+
+def _requested_partitions(by_node):
+    return set(
+        TopicPartition(topic.topic, partition.partition)
+        for request, _ in by_node.values()
+        for topic in request.topics
+        for partition in topic.partitions
+    )
+
+
+def test_create_fetch_requests_double_pause(fetcher, topic, mocker):
+    """Network gating: a partition paused under two independent reason
+    tokens stays out of fetch requests until BOTH tokens are removed, and
+    the paused-state query agrees at every step."""
+    mocker.patch.object(fetcher._manager.cluster, "leader_for_partition", return_value=0)
+    mocker.patch.object(fetcher._manager.cluster, "leader_epoch_for_partition", return_value=0)
+    mocker.patch.object(fetcher._client, "ready", return_value=True)
+    tp = TopicPartition(topic, 0)
+
+    fetcher._subscriptions.pause_with_reason(tp, 'rate-limit')
+    fetcher._subscriptions.pause_with_reason(tp, 'maintenance')
+
+    requested = _requested_partitions(fetcher._create_fetch_requests())
+    assert tp not in requested
+    assert tp not in fetcher._fetchable_partitions()
+    assert fetcher._subscriptions.is_paused(tp)
+    assert fetcher._subscriptions.paused_partitions() == {tp}
+    # Other partitions are unaffected.
+    assert TopicPartition(topic, 1) in requested
+    assert TopicPartition(topic, 2) in requested
+
+    # Lifting one token is not enough.
+    fetcher._subscriptions.resume_with_reason(tp, 'rate-limit')
+    requested = _requested_partitions(fetcher._create_fetch_requests())
+    assert tp not in requested
+    assert tp not in fetcher._fetchable_partitions()
+    assert fetcher._subscriptions.is_paused(tp)
+    assert fetcher._subscriptions.paused_partitions() == {tp}
+
+    # All tokens gone: fetch requests resume and the query agrees.
+    fetcher._subscriptions.resume_with_reason(tp, 'maintenance')
+    requested = _requested_partitions(fetcher._create_fetch_requests())
+    assert tp in requested
+    assert tp in fetcher._fetchable_partitions()
+    assert not fetcher._subscriptions.is_paused(tp)
+    assert fetcher._subscriptions.paused_partitions() == set()
+
+
+def test_create_fetch_requests_resume_after_token_expiry(fetcher, topic, mocker, fake_clock):
+    """A timed token expires on the monotonic clock; the partition
+    re-enters fetch requests without any explicit resume."""
+    mocker.patch.object(fetcher._manager.cluster, "leader_for_partition", return_value=0)
+    mocker.patch.object(fetcher._manager.cluster, "leader_epoch_for_partition", return_value=0)
+    mocker.patch.object(fetcher._client, "ready", return_value=True)
+    tp = TopicPartition(topic, 0)
+
+    fetcher._subscriptions.pause_with_reason(tp, 'rate-limit', timeout_ms=1000)
+    assert tp not in _requested_partitions(fetcher._create_fetch_requests())
+    assert fetcher._subscriptions.is_paused(tp)
+
+    fake_clock.advance(0.5)
+    assert tp not in _requested_partitions(fetcher._create_fetch_requests())
+    assert fetcher._subscriptions.is_paused(tp)
+
+    fake_clock.advance(0.6)
+    assert tp in _requested_partitions(fetcher._create_fetch_requests())
+    assert tp in fetcher._fetchable_partitions()
+    assert not fetcher._subscriptions.is_paused(tp)
+    assert fetcher._subscriptions.paused_partitions() == set()
+
+
+def test_fetched_records_double_pause_parks_until_all_reasons_resumed(fetcher, topic):
+    """Cached delivery: prefetched data for a double-paused partition is
+    parked; resuming one reason keeps it parked, resuming both delivers it."""
+    fetcher.config['check_crcs'] = False
+    tp = TopicPartition(topic, 0)
+
+    fetcher._subscriptions.pause_with_reason(tp, 'rate-limit')
+    fetcher._subscriptions.pause_with_reason(tp, 'maintenance')
+    fetcher._completed_fetches.append(_build_completed_fetch(tp, _paused_msgs(5)))
+
+    records, partial = fetcher.fetched_records()
+    assert records == {}
+    assert partial is False
+    assert tp in fetcher._paused_completed_fetches
+    assert fetcher._subscriptions.is_paused(tp)
+
+    # One token lifted: still paused, cached data stays parked.
+    fetcher._subscriptions.resume_with_reason(tp, 'rate-limit')
+    records, partial = fetcher.fetched_records()
+    assert records == {}
+    assert partial is False
+    assert tp in fetcher._paused_completed_fetches
+    assert fetcher._subscriptions.is_paused(tp)
+    assert fetcher._subscriptions.paused_partitions() == {tp}
+
+    # Both tokens lifted: parked data is delivered.
+    fetcher._subscriptions.resume_with_reason(tp, 'maintenance')
+    records, _ = fetcher.fetched_records()
+    assert tp in records
+    assert len(records[tp]) == 5
+    assert tp not in fetcher._paused_completed_fetches
+    assert not fetcher._subscriptions.is_paused(tp)
+    assert fetcher._subscriptions.paused_partitions() == set()
+
+
+def test_fetched_records_parked_data_delivered_after_token_expiry(fetcher, topic, fake_clock):
+    """Cached delivery: when the last pause token expires on the
+    monotonic clock, parked records are delivered on the next call."""
+    fetcher.config['check_crcs'] = False
+    tp = TopicPartition(topic, 0)
+
+    fetcher._subscriptions.pause_with_reason(tp, 'rate-limit', timeout_ms=1000)
+    fetcher._completed_fetches.append(_build_completed_fetch(tp, _paused_msgs(4)))
+
+    records, _ = fetcher.fetched_records()
+    assert records == {}
+    assert tp in fetcher._paused_completed_fetches
+
+    fake_clock.advance(1.1)
+    assert not fetcher._subscriptions.is_paused(tp)
+    records, _ = fetcher.fetched_records()
+    assert tp in records
+    assert len(records[tp]) == 4
+    assert tp not in fetcher._paused_completed_fetches
+
+
+def test_pause_token_renewal_keeps_partition_unfetchable(fetcher, topic, mocker, fake_clock):
+    """Renewing a timed token replaces its deadline; the previous
+    deadline must not make the partition fetchable again."""
+    mocker.patch.object(fetcher._manager.cluster, "leader_for_partition", return_value=0)
+    mocker.patch.object(fetcher._manager.cluster, "leader_epoch_for_partition", return_value=0)
+    mocker.patch.object(fetcher._client, "ready", return_value=True)
+    tp = TopicPartition(topic, 0)
+
+    fetcher._subscriptions.pause_with_reason(tp, 'rate-limit', timeout_ms=1000)
+    fake_clock.advance(0.9)
+    fetcher._subscriptions.pause_with_reason(tp, 'rate-limit', timeout_ms=1000)
+
+    fake_clock.advance(0.2)  # original deadline (t=1.0) has passed
+    assert fetcher._subscriptions.is_paused(tp)
+    assert tp not in _requested_partitions(fetcher._create_fetch_requests())
+
+    fake_clock.advance(0.9)  # renewed deadline (t=1.9) has passed
+    assert not fetcher._subscriptions.is_paused(tp)
+    assert tp in _requested_partitions(fetcher._create_fetch_requests())
 def test__parse_fetched_data__stale_offset(fetcher, topic, mocker):
     fetcher.config['check_crcs'] = False
     tp = TopicPartition(topic, 0)

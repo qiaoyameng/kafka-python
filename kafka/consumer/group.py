@@ -1017,6 +1017,12 @@ class KafkaConsumer:
         Note: This method does not affect partition subscription. In particular,
         it does not cause a group rebalance when automatic assignment is used.
 
+        Compatibility: this legacy pause is tracked as its own reserved
+        reason token (see :meth:`~kafka.KafkaConsumer.pause_with_reason`),
+        so :meth:`~kafka.KafkaConsumer.resume` restores pre-token behavior
+        for pure pause()/resume() users but never lifts pauses created with
+        an explicit reason.
+
         Arguments:
             *partitions (TopicPartition): Partitions to pause.
         """
@@ -1029,6 +1035,72 @@ class KafkaConsumer:
         # we expect pauses to get handled automatically and therefore
         # we do not need to reset the full iterator (forcing a full refetch)
 
+    def pause_with_reason(self, *partitions, reason, timeout_ms=None):
+        """Suspend fetching from the requested partitions under a named
+        reason token.
+
+        A partition stays paused while at least one unexpired reason token
+        remains, so independent subsystems (e.g. downstream rate-limiting
+        and manual maintenance) can pause the same partition without a
+        single resume lifting the other's pause. Use
+        :meth:`~kafka.KafkaConsumer.resume_with_reason` to remove exactly
+        one token; the partition resumes fetching only once every token is
+        removed or expired.
+
+        Tokens are scoped to the current assignment: a rebalance that
+        revokes a partition drops its tokens, so they never affect the
+        partition's next owner.
+
+        Arguments:
+            *partitions (TopicPartition): Partitions to pause.
+            reason (str): Non-empty token identifying the pause cause.
+            timeout_ms (int, optional): If set, the token auto-expires
+                after this many milliseconds (monotonic clock). Re-pausing
+                the same reason renews the deadline; the renewed pause
+                cannot be lifted early by the previous deadline. Default
+                None pauses indefinitely.
+        """
+        if not all([isinstance(p, TopicPartition) for p in partitions]):
+            raise TypeError('partitions must be TopicPartition namedtuples')
+        for partition in partitions:
+            log.debug("Pausing partition %s (reason=%r, timeout_ms=%s)",
+                      partition, reason, timeout_ms)
+            self._subscription.pause_with_reason(partition, reason, timeout_ms=timeout_ms)
+
+    def resume_with_reason(self, *partitions, reason):
+        """Remove a single pause reason token from the given partitions.
+
+        Each partition resumes fetching only when no other active pause
+        tokens (reason-based, unexpired, or legacy) remain.
+
+        Arguments:
+            *partitions (TopicPartition): Partitions to unpause for
+                ``reason``.
+            reason (str): The reason token to remove.
+        """
+        if not all([isinstance(p, TopicPartition) for p in partitions]):
+            raise TypeError('partitions must be TopicPartition namedtuples')
+        for partition in partitions:
+            log.debug("Resuming partition %s (reason=%r)", partition, reason)
+            self._subscription.resume_with_reason(partition, reason)
+
+    def pause_reasons(self, partition):
+        """Get the active (unexpired) user-supplied pause reasons for a
+        partition.
+
+        Arguments:
+            partition (TopicPartition): Partition to query.
+
+        Returns:
+            frozenset: active reason strings (empty if not paused by any
+            reason token, or if the partition is not assigned). The
+            reserved legacy :meth:`~kafka.KafkaConsumer.pause` token is
+            not included.
+        """
+        if not isinstance(partition, TopicPartition):
+            raise TypeError('partition must be a TopicPartition namedtuple')
+        return self._subscription.pause_reasons(partition)
+
     def paused(self):
         """Get the partitions that were previously paused using
         :meth:`~kafka.KafkaConsumer.pause`.
@@ -1040,6 +1112,11 @@ class KafkaConsumer:
 
     def resume(self, *partitions):
         """Resume fetching from the specified (paused) partitions.
+
+        Compatibility: removes only the reserved legacy pause token (see
+        :meth:`~kafka.KafkaConsumer.pause`). Pauses created via
+        :meth:`~kafka.KafkaConsumer.pause_with_reason` are not lifted, so
+        pauses from independent subsystems stay isolated.
 
         Arguments:
             *partitions (TopicPartition): Partitions to resume.
