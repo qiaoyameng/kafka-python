@@ -315,7 +315,7 @@ def test__send_list_offsets_requests(fetcher, manager, net, mocker):
     tp = TopicPartition("topic_send_list_offsets", 1)
 
     pending = []
-    async def fake_send(node_id, timestamps):
+    async def fake_send(node_id, timestamps, missing_error_factory=None):
         f = net.create_future()  # awaited below
         pending.append(f)
         return await f
@@ -369,7 +369,7 @@ def test__send_list_offsets_requests_multiple_nodes(fetcher, manager, net, mocke
     tp4 = TopicPartition("topic_send_list_offsets", 4)
 
     send_futures = []
-    async def fake_send(node_id, timestamps):
+    async def fake_send(node_id, timestamps, missing_error_factory=None):
         f = net.create_future()  # awaited below
         send_futures.append((node_id, timestamps, f))
         return await f

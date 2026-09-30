@@ -107,6 +107,37 @@ class LogTruncationError(KafkaError):
         super().__init__(*args or ('Detected truncated partitions: %s' % (divergent_offsets,),))
 
 
+class BoundedConsumptionError(KafkaError):
+    """Base class for failures while consuming a fixed offline snapshot.
+
+    Bounded consumption (see :meth:`KafkaConsumer.bounded_consume`) records
+    each partition's end offset up front and only returns records below that
+    boundary, so completion is driven by positions reaching their snapshot
+    offsets -- never by an idle timeout. The concrete subclasses make the
+    ways a snapshot can become invalid explicit instead of silently
+    resetting, skipping, or waiting forever:
+
+    - :class:`LogTruncationError` - records below the snapshot were deleted
+      before they were read.
+    - :class:`SnapshotPartitionNotFoundError` - a snapshotted partition
+      disappeared (deleted topic/partition or lost leadership metadata)
+      before its boundary was reached.
+    - :class:`OffsetOutOfRangeError` - the position was seeked past the
+      recorded end offset.
+    """
+
+
+class SnapshotPartitionNotFoundError(BoundedConsumptionError):
+    """A partition captured in a bounded-consume snapshot no longer exists.
+
+    Raised when the broker cannot resolve a snapshotted partition's end
+    offset because the topic or partition was deleted (or its metadata can
+    no longer be found) before bounded consumption reached its boundary.
+    Re-running the bounded consume against a fresh snapshot is required;
+    silently dropping the partition would under-report the reconciliation.
+    """
+
+
 class NodeNotReadyError(RetriableError):
     pass
 

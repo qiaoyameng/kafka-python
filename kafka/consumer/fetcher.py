@@ -188,6 +188,52 @@ class Fetcher:
         # never both - awaiting-validation requires a valid position).
         self._validation_task = None
         self._cached_log_truncation = None
+        # Bounded (offline reconciliation) consumption. When a set of
+        # TopicPartitions is installed via begin_bounded(), a fetch that comes
+        # back OFFSET_OUT_OF_RANGE for one of them is raised explicitly
+        # instead of being silently auto-reset: the recorded snapshot
+        # boundary must remain trustworthy. None means ordinary unbounded
+        # consumption.
+        self._bounded_partitions = None
+        # Strict-mode factory for the in-flight ListOffsets fan-out. Set
+        # around beginning_or_end_offset() so the call chain keeps its
+        # historical single-argument signatures.
+        self._list_offsets_missing_error_factory = None
+
+    def begin_bounded(self, partitions):
+        """Mark ``partitions`` as covered by a fixed end-offset snapshot.
+
+        While installed, the fetcher must not auto-reset a position the
+        broker reports as out of range for these partitions (that would
+        silently move consumption away from the recorded boundary).
+        """
+        self._bounded_partitions = set(partitions)
+
+    def end_bounded(self):
+        """Clear the bounded-consumption marker installed by begin_bounded()."""
+        self._bounded_partitions = None
+
+    def is_bounded(self, partition):
+        return self._bounded_partitions is not None and partition in self._bounded_partitions
+
+    def end_offsets_snapshot(self, partitions, timeout_ms=None):
+        """Record the current visible end offset for each partition.
+
+        The boundary uses the consumer's configured ``isolation_level``:
+        for ``read_committed`` the ListOffsets request asks for the last
+        stable offset (LSO), so open transactions are excluded from the
+        snapshot; otherwise the high-watermark-style log end is used.
+
+        Unlike :meth:`end_offsets`, a partition whose end offset cannot be
+        resolved (topic/partition deleted or metadata permanently
+        unavailable) is raised as
+        :class:`~kafka.errors.SnapshotPartitionNotFoundError` rather than
+        retried until the call times out -- an offline reconciliation
+        snapshot with a missing partition is invalid.
+        """
+        return self.beginning_or_end_offset(
+            partitions, OffsetSpec.LATEST, timeout_ms,
+            missing_error_factory=Errors.SnapshotPartitionNotFoundError)
 
     @property
     def _enable_incremental_fetch_sessions(self):
@@ -442,7 +488,8 @@ class Fetcher:
             if not timestamps:
                 return {}
 
-            future = self._manager.call_soon(self._send_list_offsets_requests, timestamps)
+            future = self._manager.call_soon(
+                self._send_list_offsets_requests, timestamps)
             try:
                 refresh_future = None
                 backoff = False
@@ -516,7 +563,8 @@ class Fetcher:
         return self.beginning_or_end_offset(
             partitions, OffsetSpec.LATEST, timeout_ms)
 
-    def beginning_or_end_offset(self, partitions, timestamp, timeout_ms=None):
+    def beginning_or_end_offset(self, partitions, timestamp, timeout_ms=None,
+                                missing_error_factory=None):
         """Fetch offset for each partition using ``timestamp``.
 
         Blocks until offsets are obtained, a non-retriable exception is raised
@@ -529,6 +577,11 @@ class Fetcher:
                 Otherwise timestamp is treated as epoch milliseconds.
             timeout_ms (int, optional): Maximum time in milliseconds to block.
                 Defaults to default_api_timeout_ms.
+            missing_error_factory (callable, optional): When provided, a
+                partition whose end offset cannot be resolved because the
+                topic/partition is gone (UNKNOWN_TOPIC_OR_PARTITION) is
+                raised by calling ``missing_error_factory([tp, ...])``
+                instead of being retried until timeout.
 
         Returns:
             {TopicPartition: int}: Mapping of partition to retrieved offset.
@@ -542,7 +595,13 @@ class Fetcher:
         timestamps = dict([(tp, timestamp) for tp in partitions])
         if timeout_ms is None:
             timeout_ms = self.config['default_api_timeout_ms']
-        offsets = self._net.run(self._fetch_offsets_by_times_async, timestamps, timeout_ms, timeout_ms=timeout_ms)
+        self._list_offsets_missing_error_factory = missing_error_factory
+        try:
+            offsets = self._net.run(
+                self._fetch_offsets_by_times_async, timestamps, timeout_ms,
+                timeout_ms=timeout_ms)
+        finally:
+            self._list_offsets_missing_error_factory = None
         for tp in timestamps:
             offsets[tp] = offsets[tp].offset
         return offsets
@@ -814,7 +873,7 @@ class Fetcher:
             raise Errors.StaleMetadata()
 
         futures = [
-            self._manager.call_soon(self._send_list_offsets_request, node_id, ts)
+            self._manager.call_soon(self._send_node_list_offsets, node_id, ts)
             for node_id, ts in timestamps_by_node.items()
         ]
 
@@ -843,7 +902,17 @@ class Fetcher:
                 timestamps_by_node[node_id][partition] = (timestamp, leader_epoch)
         return dict(timestamps_by_node)
 
-    async def _send_list_offsets_request(self, node_id, timestamps_and_epochs):
+    async def _send_node_list_offsets(self, node_id, timestamps_and_epochs):
+        # Keyword so existing test doubles that patch
+        # ``_send_list_offsets_request`` with the two-argument signature keep
+        # working when they do not model strict snapshot lookups.
+        return await self._send_list_offsets_request(
+            node_id, timestamps_and_epochs,
+            missing_error_factory=getattr(
+                self, '_list_offsets_missing_error_factory', None))
+
+    async def _send_list_offsets_request(self, node_id, timestamps_and_epochs,
+                                         missing_error_factory=None):
         """Send single ListOffsetsResponse to node_id
 
         Returns:
@@ -872,9 +941,10 @@ class Fetcher:
 
         log.debug("Sending ListOffsetRequest %s to broker %s", request, node_id)
         response = await self._manager.send(request, node_id=node_id)
-        return self._handle_list_offsets_response(response)
+        return self._handle_list_offsets_response(
+            response, missing_error_factory=missing_error_factory)
 
-    def _handle_list_offsets_response(self, response):
+    def _handle_list_offsets_response(self, response, missing_error_factory=None):
         """Parse a ListOffsets response.
 
         Returns:
@@ -934,6 +1004,8 @@ class Fetcher:
                                 "request for partition %s. The topic/partition " +
                                 "may not exist or the user may not have Describe access "
                                 "to it.", tp)
+                    if missing_error_factory is not None:
+                        raise missing_error_factory([tp])
                     partitions_to_retry.add(tp)
                 elif error_type is Errors.TopicAuthorizationFailedError:
                     unauthorized_topics.add(tp.topic)
@@ -1512,6 +1584,11 @@ class Fetcher:
                 log.debug("Error fetching partition %s: %s", tp, error_type.__name__)
                 self._maybe_update_current_leader(tp, completed_fetch.partition_data)
                 self._manager.cluster.request_update()
+                if (error_type is Errors.UnknownTopicOrPartitionError
+                        and self.is_bounded(tp)):
+                    # A snapshotted partition vanished mid-run: raise rather
+                    # than refresh-and-retry forever.
+                    raise Errors.SnapshotPartitionNotFoundError([tp])
             elif error_type in (Errors.FencedLeaderEpochError,
                                 Errors.UnknownLeaderEpochError):
                 # KIP-320: the broker has a different view of the leader epoch
@@ -1542,6 +1619,13 @@ class Fetcher:
                     if cleared is not None:
                         log.debug("Fetch offset %s out of range for %s on follower %s;"
                                   " retrying from leader", fetch_offset, tp, cleared)
+                    elif self.is_bounded(tp):
+                        # Offline reconciliation: the position (or a user
+                        # seek past it) fell outside the log while a fixed
+                        # snapshot was in progress. Auto-resetting would
+                        # silently skip below the recorded end offset or read
+                        # beyond it; surface the boundary violation instead.
+                        raise Errors.OffsetOutOfRangeError({tp: fetch_offset})
                     elif self._subscriptions.has_default_offset_reset_policy():
                         log.info("Fetch offset %s is out of range for topic-partition %s",
                                  fetch_offset, tp)

@@ -1133,6 +1133,198 @@ class KafkaConsumer:
             self._subscription.request_offset_reset(tp, OffsetResetStrategy.LATEST)
         self._iterator = None
 
+    def bounded_consume(self, partitions=None, timeout_ms=None):
+        """Consume only records that already exist, up to a fixed snapshot.
+
+        Offline reconciliation helper. At call start the current *visible*
+        end offset of every requested partition is recorded once; iteration
+        then yields records strictly below those boundaries and stops as
+        soon as every partition has reached its own boundary. Records
+        appended to the broker afterwards are never read -- completion is
+        determined solely by positions reaching the recorded offsets, never
+        by an idle timeout.
+
+        With ``isolation_level='read_committed'`` the boundary for each
+        partition is its last stable offset (LSO), so records belonging to
+        open/in-flight transactions at snapshot time are excluded and
+        iteration stops at the committed-data boundary.
+
+        Arguments:
+            partitions (list of TopicPartition, optional): Partitions to
+                snapshot. Defaults to every currently assigned partition.
+                Each must be assigned and currently unpaused.
+            timeout_ms (int, optional): Total wall-clock budget, in
+                milliseconds, for reaching the recorded boundaries
+                (includes resolving initial positions and the end offsets
+                and fetching records up to them). Defaults to
+                ``default_api_timeout_ms``. This bounds *waiting* (a slow
+                or unreachable broker); it is deliberately not an
+                "no new records for a while, assume done" idle rule -- a
+                timeout raises :class:`~kafka.errors.KafkaTimeoutError`
+                rather than declaring the snapshot consumed.
+
+        Yields:
+            ConsumerRecord: records at or above the current position and
+                strictly below the snapshot end offset for each partition.
+
+        Raises:
+            TypeError: if any partition is not a TopicPartition.
+            ValueError: if no partitions are given, any partition is not
+                assigned or paused, or a position is already at/beyond its
+                recorded boundary (a seek past the snapshot boundary).
+            SnapshotPartitionNotFoundError: if a snapshotted partition
+                disappears (topic/partition deleted) before or during
+                bounded consumption.
+            OffsetOutOfRangeError: if a position falls outside the
+                broker's log while bounded (log retention/compaction, or a
+                seek past the boundary); it is raised explicitly rather
+                than silently auto-reset.
+            LogTruncationError: if KIP-320 validation detects the broker
+                truncated records below a position.
+            KafkaTimeoutError: if the boundaries are not reached within
+                ``timeout_ms``.
+
+        On normal completion the consumer's positions equal the snapshot
+        end offsets and the snapshotted partitions are paused; call
+        :meth:`resume` to continue ordinary live consumption.
+        """
+        if partitions is None:
+            partitions = list(self._subscription.assigned_partitions())
+        partitions = list(partitions)
+        if not partitions:
+            raise ValueError('bounded_consume requires at least one assigned partition')
+        if not all(isinstance(p, TopicPartition) for p in partitions):
+            raise TypeError('partitions must be TopicPartition namedtuples')
+        for tp in partitions:
+            if not self._subscription.is_assigned(tp):
+                raise ValueError('Unassigned partition: %s' % (tp,))
+            if self._subscription.is_paused(tp):
+                raise ValueError('Cannot bounded consume paused partition: %s' % (tp,))
+
+        if timeout_ms is None:
+            timeout_ms = self.config['default_api_timeout_ms']
+        deadline = time.monotonic() + timeout_ms / 1000.0
+
+        def remaining_ms():
+            return max(0, int((deadline - time.monotonic()) * 1000))
+
+        # Ensure cluster metadata covers the assigned topics so leaders are
+        # known for the snapshot ListOffsets fan-out (manual assign() flags
+        # topics, but a leader may not be cached yet). A partition that the
+        # metadata definitively says does not exist is an error rather than
+        # a timeout; transient unknown-leader states refresh and retry.
+        def _leaders_known():
+            ready = True
+            for tp in partitions:
+                known = self._cluster.partitions_for_topic(tp.topic)
+                if known is not None and tp.partition not in known:
+                    raise Errors.SnapshotPartitionNotFoundError([tp])
+                if self._cluster.leader_for_partition(tp) in (None, -1):
+                    ready = False
+            return ready
+
+        if not _leaders_known():
+            update = self._cluster.request_update()
+            self._net.wait_for(update, timeout_ms=remaining_ms(), raise_error=False)
+        while not _leaders_known():
+            if remaining_ms() <= 0:
+                raise Errors.KafkaTimeoutError(
+                    'Metadata for bounded-consume partitions did not resolve '
+                    'before timeout: %s' % (partitions,))
+            update = self._cluster.request_update()
+            self._net.wait_for(update, timeout_ms=remaining_ms(), raise_error=False)
+
+        # Make sure every partition has a concrete fetch position before we
+        # record boundaries (committed offsets / auto-offset-reset resolve
+        # here). position() blocks until resolution or raises.
+        for tp in partitions:
+            position = self.position(tp, timeout_ms=remaining_ms())
+            if position is None:
+                raise Errors.KafkaTimeoutError(
+                    'Could not resolve position for %s before snapshot' % (tp,))
+
+        end_offsets = self._fetcher.end_offsets_snapshot(
+            partitions, timeout_ms=remaining_ms())
+
+        snapshot = {}
+        for tp in partitions:
+            end = end_offsets[tp]
+            position = self._subscription.assignment[tp].position.offset
+            if position > end:
+                # A seek (or prior position) already lies beyond the
+                # boundary recorded at startup: there is no data to
+                # reconcile and silently clamping would hide that.
+                raise Errors.OffsetOutOfRangeError({tp: position})
+            snapshot[tp] = end
+
+        self._fetcher.begin_bounded(snapshot)
+        # The iterator interface must not be live while bounded_consume
+        # drives poll() itself.
+        self._iterator = None
+        try:
+            # A partition already positioned on its boundary contributes no
+            # records; pause it up front so it never enters the poll loop
+            # (where an empty partition would just burn the timeout).
+            remaining = {}
+            for tp, boundary in snapshot.items():
+                position = self._subscription.assignment[tp].position.offset
+                if position >= boundary:
+                    self._subscription.pause(tp)
+                else:
+                    remaining[tp] = boundary
+            while remaining:
+                wait_ms = remaining_ms()
+                if wait_ms <= 0:
+                    raise Errors.KafkaTimeoutError(
+                        'Bounded consumption did not reach snapshot '
+                        'boundaries before timeout: %s' % (remaining,))
+                # A partition whose topic is present in metadata but whose
+                # partition id is gone has definitively been deleted -- do
+                # not retry until timeout like a transient leader move.
+                for tp in list(remaining):
+                    known = self._cluster.partitions_for_topic(tp.topic)
+                    if known is not None and tp.partition not in known:
+                        raise Errors.SnapshotPartitionNotFoundError([tp])
+                records = self.poll(timeout_ms=wait_ms, update_offsets=False)
+                for tp in list(records):
+                    if tp not in snapshot:
+                        # Non-snapshotted partitions must keep advancing
+                        # normally (poll was issued for the whole
+                        # assignment); track their positions ourselves.
+                        batch = records.pop(tp)
+                        if batch:
+                            last = batch[-1]
+                            self._subscription.assignment[tp].position = OffsetAndMetadata(
+                                last.offset + 1, '', last.leader_epoch)
+                        continue
+                    boundary = snapshot[tp]
+                    position = self._subscription.assignment[tp].position.offset
+                    if position > boundary:
+                        raise Errors.OffsetOutOfRangeError({tp: position})
+                    kept = []
+                    for record in records[tp]:
+                        if record.offset < boundary:
+                            kept.append(record)
+                            position = record.offset + 1
+                        else:
+                            # Nothing at/above the snapshot boundary should
+                            # ever have been fetched: pause stops it.
+                            break
+                    if kept:
+                        self._subscription.assignment[tp].position = OffsetAndMetadata(
+                            position, '', kept[-1].leader_epoch)
+                    del records[tp]
+                    if position >= boundary:
+                        # Boundary reached: stop fetching this partition so
+                        # records appended after the snapshot can never be
+                        # pulled in.
+                        self._subscription.pause(tp)
+                        remaining.pop(tp, None)
+                    for record in kept:
+                        yield record
+        finally:
+            self._fetcher.end_bounded()
+
     def subscribe(self, topics=(), pattern=None, listener=None):
         """Subscribe to a list of topics, or a topic regex pattern.
 
