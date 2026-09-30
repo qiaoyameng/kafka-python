@@ -107,6 +107,54 @@ class LogTruncationError(KafkaError):
         super().__init__(*args or ('Detected truncated partitions: %s' % (divergent_offsets,),))
 
 
+class BoundedConsumptionError(KafkaError):
+    """Base class for failures while consuming a fixed offset snapshot."""
+
+
+class PartitionUnavailableError(BoundedConsumptionError):
+    """A bounded-consumption partition disappeared from the cluster.
+
+    Raised when one of the partitions captured in the initial end-offset
+    snapshot can no longer be located (topic/partition deleted, or no known
+    leader) before its records up to the snapshot boundary have been read.
+    Unlike an ordinary poll loop - which silently retries on metadata churn
+    in the hope that the partition returns - bounded consumption reports the
+    condition explicitly so an offline reconciliation job does not finish
+    while silently skipping the lost partition's records.
+
+    ``partition`` is the :class:`~kafka.structs.TopicPartition` that vanished.
+    """
+
+    def __init__(self, partition, *args):
+        self.partition = partition
+        super().__init__(*args or (
+            'Partition %s disappeared before bounded consumption reached its'
+            ' snapshot end offset' % (partition,),))
+
+
+class OffsetBeyondSnapshotError(BoundedConsumptionError):
+    """A seek moved a bounded-consumption position outside its snapshot.
+
+    Raised when :meth:`~kafka.KafkaConsumer.seek` (or a position reset) moves
+    a partition to an offset that is not reachable within the captured
+    end-offset boundary - either behind the log start after truncation, or
+    ahead of the end offset snapshotted when bounded consumption began.
+
+    Attributes:
+        partition (TopicPartition): The partition whose position changed.
+        requested_offset (int): The offset the position was moved to.
+        snapshot_end_offset (int): The end offset captured at startup.
+    """
+
+    def __init__(self, partition, requested_offset, snapshot_end_offset, *args):
+        self.partition = partition
+        self.requested_offset = requested_offset
+        self.snapshot_end_offset = snapshot_end_offset
+        super().__init__(*args or (
+            'Seek to offset %d for %s is outside the bounded snapshot end'
+            ' offset %d' % (requested_offset, partition, snapshot_end_offset),))
+
+
 class NodeNotReadyError(RetriableError):
     pass
 

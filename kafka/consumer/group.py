@@ -9,6 +9,7 @@ import kafka.errors as Errors
 from kafka.errors import KafkaConfigurationError, UnsupportedVersionError
 
 from kafka.consumer.fetcher import Fetcher
+from kafka.consumer.bounded import BoundedConsumption
 from kafka.consumer.subscription_state import SubscriptionState
 from kafka.coordinator.consumer import ConsumerCoordinator
 from kafka.coordinator.assignors.range import RangePartitionAssignor
@@ -1076,6 +1077,10 @@ class KafkaConsumer:
         if partition not in self._subscription.assigned_partitions():
             raise ValueError('Unassigned partition')
         log.debug("Seeking to offset %s for partition %s", offset, partition)
+        snapshot = self._fetcher.bounded_end_offsets_snapshot
+        if snapshot is not None and partition in snapshot and offset > snapshot[partition]:
+            raise Errors.OffsetBeyondSnapshotError(
+                partition, offset, snapshot[partition])
         self._subscription.assignment[partition].seek(offset)
         self._iterator = None
 
@@ -1428,3 +1433,48 @@ class KafkaConsumer:
         if self.config['consumer_timeout_ms'] >= 0:
             self._consumer_timeout = time.monotonic() + (
                 self.config['consumer_timeout_ms'] / 1000.0)
+
+    # ------------------------------------------------------------------
+    # Bounded (finite) consumption for offline reconciliation jobs
+    # ------------------------------------------------------------------
+
+    def bounded_consumption(self, partitions=None, timeout_ms=None):
+        """Return a context manager that consumes only pre-existing data.
+
+        On entry, the visible end offset of every requested partition is
+        snapshotted exactly once (a ``ListOffsets(LATEST)`` request; with
+        ``isolation_level='read_committed'`` the broker reports the last
+        stable offset, so open/in-flight transactions are excluded). Polling
+        and iteration inside the ``with`` block return records strictly below
+        those offsets only, then report completion. Messages appended to the
+        broker after the snapshot - even while the job is still running - are
+        not part of this run and can never extend it.
+
+        Completion is determined by comparing each partition's position with
+        its snapshotted end offset; an idle broker with no new records does
+        **not** count as completion (so ``poll`` may block up to
+        ``timeout_ms`` while records are still in flight).
+
+        Arguments:
+            partitions (iterable of TopicPartition, optional): Partitions to
+                bound. Defaults to the consumer's current assignment; every
+                such partition must be assigned. If the consumer has no
+                assignment yet, assign partitions first.
+            timeout_ms (int, optional): Per-operation timeout used for the
+                snapshot lookup and for subsequent polls. Defaults to
+                default_api_timeout_ms.
+
+        Returns:
+            BoundedConsumption: context manager with ``poll`` / ``done`` /
+            ``end_offsets`` / ``remaining`` helpers.
+
+        Raises:
+            Errors.PartitionUnavailableError: if a snapshot partition no
+                longer exists at entry (or disappears mid-run).
+            Errors.OffsetOutOfRangeError: if the position falls outside the
+                log due to truncation (positions are never silently reset).
+            Errors.OffsetBeyondSnapshotError: if a seek moves outside the
+                snapshot boundaries during the run.
+            KafkaTimeoutError: if the snapshot cannot be fetched in time.
+        """
+        return BoundedConsumption(self, partitions=partitions, timeout_ms=timeout_ms)

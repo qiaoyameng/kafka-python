@@ -178,6 +178,10 @@ class Fetcher:
         self._nodes_with_pending_fetch_requests = set()
         self._cached_list_offsets_exception = None
         self._next_in_line_exception_metadata = None
+        # Bounded-consumption snapshot: {TopicPartition: end_offset} captured
+        # once when a bounded run starts. While non-None, fetching stops at
+        # these offsets even if the broker keeps appending messages.
+        self._bounded_end_offsets = None
         # In-flight offset-reset Task, cached across reset_offsets_if_needed
         # calls so concurrent callers (consumer.poll fire-and-forget,
         # consumer.position blocking-await) share one fan-out instead of
@@ -516,6 +520,130 @@ class Fetcher:
         return self.beginning_or_end_offset(
             partitions, OffsetSpec.LATEST, timeout_ms)
 
+    # ------------------------------------------------------------------
+    # Bounded (finite) consumption
+    # ------------------------------------------------------------------
+
+    def bounded_end_offsets(self, partitions, timeout_ms=None):
+        """Fetch the visible end offsets for a bounded consumption snapshot.
+
+        Like :meth:`end_offsets`, but every requested partition must resolve.
+        With ``isolation_level='read_committed'`` the broker reports the last
+        stable offset (LSO) rather than the log end offset, so committed
+        records past the LSO cannot leak into the snapshot.
+
+        Arguments:
+            partitions ([TopicPartition]): Partitions to snapshot.
+            timeout_ms (int, optional): Maximum block time. Defaults to
+                default_api_timeout_ms.
+
+        Returns:
+            {TopicPartition: int}: Visible end offset for every partition.
+
+        Raises:
+            Errors.PartitionUnavailableError: if any partition has
+                disappeared (deleted topic/partition, no leader) rather than
+                merely being transiently unavailable.
+            KafkaTimeoutError: if the offsets cannot be resolved in time.
+        """
+        if not partitions:
+            return {}
+        if timeout_ms is None:
+            timeout_ms = self.config['default_api_timeout_ms']
+        timestamps = {tp: OffsetSpec.LATEST for tp in partitions}
+        try:
+            offsets = self._net.run(
+                self._fetch_offsets_by_times_async, timestamps, timeout_ms,
+                timeout_ms=timeout_ms)
+        except Errors.KafkaTimeoutError:
+            # A partition that the refreshed metadata no longer lists is
+            # gone for good; every other stall stays a timeout so callers
+            # can distinguish disappearance from a slow/down broker.
+            for tp in partitions:
+                known = self._manager.cluster.partitions_for_topic(tp.topic)
+                if known is None or tp.partition not in known:
+                    raise Errors.PartitionUnavailableError(tp)
+            raise
+        missing = [tp for tp in partitions if tp not in offsets]
+        if missing:
+            # Callers verify partition existence via a metadata refresh
+            # beforehand; a partition that still cannot resolve after the
+            # ListOffsets round-trips is reported explicitly rather than
+            # silently omitted from the snapshot.
+            raise Errors.PartitionUnavailableError(missing[0])
+        return {tp: offsets[tp].offset for tp in partitions}
+
+    def begin_bounded_consumption(self, end_offsets):
+        """Arm a bounded-consumption snapshot.
+
+        Arguments:
+            end_offsets ({TopicPartition: int}): Per-partition end offsets
+                captured once (via :meth:`bounded_end_offsets`). Subsequent
+                fetches and drained records are clipped to these offsets;
+                partitions at their end offset are not fetched again even if
+                the broker keeps appending messages.
+        """
+        if self._bounded_end_offsets is not None:
+            raise Errors.IllegalStateError(
+                'Bounded consumption is already active; call '
+                'end_bounded_consumption() before starting another run')
+        for tp, end in end_offsets.items():
+            if not isinstance(end, int) or end < 0:
+                raise ValueError(
+                    'End offset for %s must be an int >= 0, got %r' % (tp, end))
+        self._bounded_end_offsets = dict(end_offsets)
+        log.info('Starting bounded consumption with snapshot end offsets %s',
+                 self._bounded_end_offsets)
+
+    def end_bounded_consumption(self):
+        """Disarm bounded consumption, restoring ordinary open-ended fetching."""
+        if self._bounded_end_offsets is None:
+            return
+        log.info('Ending bounded consumption at %s', self._bounded_end_offsets)
+        self._bounded_end_offsets = None
+
+    @property
+    def bounded_end_offsets_snapshot(self):
+        """Current snapshot ``{TopicPartition: end_offset}``, or None."""
+        return None if self._bounded_end_offsets is None else dict(self._bounded_end_offsets)
+
+    def bounded_partitions_finished(self, partitions=None):
+        """Return partitions whose position has reached the snapshot boundary.
+
+        Arguments:
+            partitions (iterable of TopicPartition, optional): Partitions to
+                check; defaults to every partition in the snapshot.
+
+        Returns:
+            set[TopicPartition]: partitions at (or beyond) their end offset.
+        """
+        if self._bounded_end_offsets is None:
+            return set()
+        if partitions is None:
+            partitions = self._bounded_end_offsets
+        finished = set()
+        for tp in partitions:
+            end = self._bounded_end_offsets.get(tp)
+            if end is None:
+                continue
+            state = self._subscriptions.assignment.get(tp)
+            if state is not None and state.position is not None \
+                    and state.position.offset >= end:
+                finished.add(tp)
+        return finished
+
+    def bounded_remaining(self, partition):
+        """Records still to read for ``partition`` before its boundary."""
+        if self._bounded_end_offsets is None:
+            return None
+        end = self._bounded_end_offsets.get(partition)
+        if end is None:
+            return None
+        state = self._subscriptions.assignment.get(partition)
+        if state is None or state.position is None:
+            return end
+        return end - state.position.offset
+
     def beginning_or_end_offset(self, partitions, timestamp, timeout_ms=None):
         """Fetch offset for each partition using ``timestamp``.
 
@@ -656,6 +784,21 @@ class Fetcher:
                 log.debug("Returning fetched records at offset %d for assigned"
                           " partition %s", position.offset, tp)
                 part_records = part.take(max_records)
+                bounded_end = None
+                if self._bounded_end_offsets is not None:
+                    bounded_end = self._bounded_end_offsets.get(tp)
+                if bounded_end is not None:
+                    in_range = [r for r in part_records if r.offset < bounded_end]
+                    if len(in_range) < len(part_records):
+                        # The broker returned records past the snapshot end
+                        # (messages appended after the snapshot, or a batch
+                        # spanning the boundary). Rewind the part's consumed
+                        # cursor so its position lands exactly on the end
+                        # offset, and drop the remainder of this completion.
+                        last = in_range[-1].offset if in_range else position.offset
+                        part.next_fetch_offset = last + 1
+                        part.drain()
+                    part_records = in_range
                 # list.extend([]) is a noop, but because drained is a defaultdict
                 # we should avoid initializing the default list unless there are records
                 if part_records:
@@ -1235,6 +1378,17 @@ class Fetcher:
             discard.add(current.topic_partition)
         discard.update(self._paused_completed_fetches)
         discard.update(self._paused_partition_records)
+        if self._bounded_end_offsets is not None:
+            # A bounded run never fetches a partition once its position has
+            # reached the end offset captured at startup - messages appended
+            # afterwards are outside this run's snapshot.
+            def _within_snapshot(tp):
+                state = self._subscriptions.assignment.get(tp)
+                if state is None or state.position is None:
+                    return True
+                end = self._bounded_end_offsets.get(tp)
+                return end is None or state.position.offset < end
+            fetchable = [tp for tp in fetchable if _within_snapshot(tp)]
         return [tp for tp in fetchable if tp not in discard]
 
     def _select_read_replica(self, tp):
@@ -1542,6 +1696,14 @@ class Fetcher:
                     if cleared is not None:
                         log.debug("Fetch offset %s out of range for %s on follower %s;"
                                   " retrying from leader", fetch_offset, tp, cleared)
+                    elif self._bounded_end_offsets is not None:
+                        # Offline bounded runs must surface retention/compaction
+                        # truncation explicitly: silently resetting to earliest
+                        # would skip records the snapshot promised to cover.
+                        log.error("Fetch offset %s is out of range for %s during"
+                                  " bounded consumption; log was truncated",
+                                  fetch_offset, tp)
+                        raise Errors.OffsetOutOfRangeError({tp: fetch_offset})
                     elif self._subscriptions.has_default_offset_reset_policy():
                         log.info("Fetch offset %s is out of range for topic-partition %s",
                                  fetch_offset, tp)
