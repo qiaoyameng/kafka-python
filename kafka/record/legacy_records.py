@@ -256,18 +256,12 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
             msg_pos + self.MAGIC_OFFSET:msg_pos + self.LOG_OVERHEAD + length]
 
     def __iter__(self):
-        if self._magic == 1:
-            key_offset = self.KEY_OFFSET_V1
-        else:
-            key_offset = self.KEY_OFFSET_V0
+        key_offset = self._key_offset()
         timestamp_type = self.timestamp_type
 
-        if self.compression_type:
-            # In case we will call iter again
-            if not self._decompressed:
-                self._buffer = memoryview(self._decompress(key_offset))
-                self._decompressed = True
+        self.decompress()
 
+        if self._decompressed:
             # If relative offset is used, we need to decompress the entire
             # message first to compute the absolute offset.
             headers = self._read_all_headers()
@@ -304,6 +298,22 @@ class LegacyRecordBatch(ABCRecordBatch, LegacyRecordBase):
             yield LegacyRecord(
                 self._magic, self._offset, self._timestamp, timestamp_type,
                 key, value, self._crc, crc_bytes)
+
+    def _key_offset(self):
+        if self._magic == 1:
+            return self.KEY_OFFSET_V1
+        return self.KEY_OFFSET_V0
+
+    def decompress(self):
+        """Decompress the wrapper payload (no-op for uncompressed batches).
+
+        Raises CorruptRecordError if the compressed body cannot be decoded.
+        Safe to call repeatedly.
+        """
+        if not self._decompressed and self.compression_type:
+            # In case we will call iter again
+            self._buffer = memoryview(self._decompress(self._key_offset()))
+            self._decompressed = True
 
 
 class LegacyRecord(ABCRecord):

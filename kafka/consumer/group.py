@@ -152,6 +152,20 @@ class KafkaConsumer:
             consumed. This ensures no on-the-wire or on-disk corruption to
             the messages occurred. This check adds some overhead, so it may
             be disabled in cases seeking extreme performance. Default: True
+        corrupt_batch_handler (callable): Called as ``handler(error)`` with a
+            :class:`~kafka.errors.CorruptBatchError` whenever a fetched batch
+            fails its CRC, cannot be decompressed, has undecodable records, or
+            has an unusable length header. The error exposes ``topic``,
+            ``partition``, the wire-level ``base_offset``, the batch byte
+            boundaries (``batch_start`` / ``batch_end``), the reliable resume
+            offset (``next_offset``), the failure ``stage`` and whether the
+            boundary is reliably known. Return
+            :data:`~kafka.errors.QUARANTINE_SKIP_BATCH` to drop the whole
+            batch and continue at the next batch; return
+            :data:`~kafka.errors.QUARANTINE_FAIL` (the default) to raise the
+            error. Skipping is permitted only when the full batch boundary is
+            known; a corrupt length header (``stage == 'framing'``) always
+            raises because the batch end cannot be located. Default: fail.
         isolation_level (str): Configure KIP-98 transactional consumer by
             setting to 'read_committed'. This will cause the consumer to
             skip records from aborted transactions. Default: 'read_uncommitted'
@@ -346,6 +360,7 @@ class KafkaConsumer:
         'auto_commit_interval_ms': 5000,
         'default_offset_commit_callback': lambda offsets, response: True,
         'check_crcs': True,
+        'corrupt_batch_handler': Errors.default_corrupt_batch_handler,
         'isolation_level': 'read_uncommitted',
         'allow_auto_create_topics': True,
         'metadata_max_age_ms': 5 * 60 * 1000,

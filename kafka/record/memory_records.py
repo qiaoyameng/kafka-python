@@ -36,7 +36,9 @@ class MemoryRecords(ABCRecords):
     # Minimum space requirements for Record V0
     MIN_SLICE = LOG_OVERHEAD + LegacyRecordBatch.RECORD_OVERHEAD_V0
 
-    __slots__ = ("_buffer", "_pos", "_next_slice", "_remaining_bytes")
+    __slots__ = ("_buffer", "_pos", "_next_slice", "_remaining_bytes",
+                 "_next_start", "_next_end", "_current_start", "_current_end",
+                 "_framing_error")
 
     def __init__(self, bytes_data):
         self._buffer = bytes_data
@@ -44,6 +46,13 @@ class MemoryRecords(ABCRecords):
         # We keep one slice ahead so `has_next` will return very fast
         self._next_slice = None
         self._remaining_bytes = None
+        # Byte positions backing the sliced batches, plus any framing failure
+        # (a length header that is present but impossible to satisfy).
+        self._next_start = None
+        self._next_end = None
+        self._current_start = None
+        self._current_end = None
+        self._framing_error = None
         self._cache_next()
 
     def size_in_bytes(self):
@@ -54,13 +63,46 @@ class MemoryRecords(ABCRecords):
         # NOTE: in Fetcher we do the call after iteration, so should be fast
         if self._remaining_bytes is None:
             next_slice = self._next_slice
+            next_start = self._next_start
+            next_end = self._next_end
+            current_start = self._current_start
+            current_end = self._current_end
+            framing_error = self._framing_error
             pos = self._pos
             while self._remaining_bytes is None:
                 self._cache_next()
             # Reset previous iterator position
             self._next_slice = next_slice
+            self._next_start = next_start
+            self._next_end = next_end
+            self._current_start = current_start
+            self._current_end = current_end
+            self._framing_error = framing_error
             self._pos = pos
         return len(self._buffer) - self._remaining_bytes
+
+    def framing_error(self):
+        """Return a description of an unreliable framing point, or None.
+
+        A non-None result means a complete length header is present but its
+        declared length can never point to a valid batch inside the buffer
+        (negative, or extending past the end of the available bytes). The end
+        of that batch cannot be located by scanning, so callers must not
+        attempt to skip over it.
+
+        Returns: tuple (start_byte, declared_length) or None.
+        """
+        return self._framing_error
+
+    def base_offset_at(self, pos):
+        """Read the wire-level base offset of the batch header at ``pos``.
+
+        The offset is read directly from the batch header bytes; it is never
+        inferred from internal records that could not be decoded. Requires at
+        least the log overhead to be available at ``pos``.
+        """
+        base_offset, = struct.unpack_from(">q", self._buffer, pos)
+        return base_offset
 
     # NOTE: we cache offsets here as kwargs for a bit more speed, as cPython
     # will use LOAD_FAST opcode in this case
@@ -73,20 +115,36 @@ class MemoryRecords(ABCRecords):
             # Will be re-checked in Fetcher for remaining bytes.
             self._remaining_bytes = remaining
             self._next_slice = None
+            self._next_start = None
+            self._next_end = None
+            self._framing_error = None
             return
 
         length, = struct.unpack_from(
             ">i", buffer, pos + len_offset)
 
         slice_end = pos + log_overhead + length
-        if slice_end > buffer_len:
+        # A negative length, or a declared batch that runs past the available
+        # bytes, cannot be reconciled with the buffer. This is distinct from a
+        # partially delivered log-overhead tail above: here the length header
+        # itself is untrustworthy, so the boundary of the batch is unknown and
+        # must not be guessed.
+        if length < 0 or slice_end > buffer_len:
+            # The first eight bytes (the batch base offset) are still
+            # readable, but the batch end is unknown.
             # Will be re-checked in Fetcher for remaining bytes
             self._remaining_bytes = remaining
             self._next_slice = None
+            self._next_start = None
+            self._next_end = None
+            self._framing_error = (pos, length)
             return
 
+        self._framing_error = None
+        self._next_start = pos
         self._next_slice = memoryview(buffer)[pos: slice_end]
         self._pos = slice_end
+        self._next_end = slice_end
 
     def has_next(self):
         return self._next_slice is not None
@@ -97,6 +155,10 @@ class MemoryRecords(ABCRecords):
         next_slice = self._next_slice
         if next_slice is None:
             return None
+        # Record the byte span of the batch we are about to hand out so
+        # callers can quarantine it using a reliably known boundary.
+        self._current_start = self._next_start
+        self._current_end = self._next_end
         if len(next_slice) < _min_slice:
             raise CorruptRecordError(
                 "Record size is less than the minimum record overhead "
@@ -115,6 +177,17 @@ class MemoryRecords(ABCRecords):
         if not self.has_next():
             raise StopIteration
         return self.next_batch()
+
+    def current_batch_range(self):
+        """Byte range (start, end) in the buffer of the last batch returned.
+
+        Available right after :meth:`next_batch`; start is the position of the
+        batch base offset and end is the first byte of the following batch.
+        Returns None if no complete batch has been yielded.
+        """
+        if self._current_start is None:
+            return None
+        return self._current_start, self._current_end
 
     next = __next__
 

@@ -2,6 +2,7 @@ import collections
 import copy
 import itertools
 import logging
+import struct
 import sys
 import time
 import warnings
@@ -90,6 +91,7 @@ class Fetcher:
         'max_partition_fetch_bytes': 1048576,
         'max_poll_records': sys.maxsize,
         'check_crcs': True,
+        'corrupt_batch_handler': Errors.default_corrupt_batch_handler,
         'metrics': None,
         'metric_group_prefix': 'consumer',
         'request_timeout_ms': 30000,
@@ -141,6 +143,12 @@ class Fetcher:
                 consumed. This ensures no on-the-wire or on-disk corruption to
                 the messages occurred. This check adds some overhead, so it may
                 be disabled in cases seeking extreme performance. Default: True
+            corrupt_batch_handler (callable): Callback invoked with a
+                CorruptBatchError for a corrupt batch; return
+                Errors.QUARANTINE_SKIP_BATCH to skip the whole batch when its
+                boundary is reliably known, or Errors.QUARANTINE_FAIL (the
+                default) to raise. A corrupt length header can never be
+                skipped. Default: fail.
             isolation_level (str): Configure KIP-98 transactional consumer by
                 setting to 'read_committed'. This will cause the consumer to
                 skip records from aborted tranactions. Default: 'read_uncommitted'
@@ -1469,11 +1477,32 @@ class Fetcher:
                                                        key_deserializer=self.config['key_deserializer'],
                                                        value_deserializer=self.config['value_deserializer'],
                                                        check_crcs=self.config['check_crcs'],
+                                                       corrupt_batch_handler=self.config['corrupt_batch_handler'],
                                                        isolation_level=self._isolation_level,
                                                        aborted_transactions=aborted_transactions,
                                                        metric_aggregator=completed_fetch.metric_aggregator,
                                                        on_drain=self._on_partition_records_drain)
                 if not records.has_next() and records.size_in_bytes() > 0:
+                    framing = records.framing_error()
+                    if framing is not None:
+                        # The very first batch has a corrupt length header.
+                        # Its end is unknown, so this can never be skipped.
+                        start_byte, declared_length = framing
+                        try:
+                            framing_base_offset = records.base_offset_at(start_byte)
+                        except (ValueError, IndexError, struct.error):
+                            framing_base_offset = None
+                        framing_error = Errors.CorruptBatchError(
+                            "Corrupt batch length header for partition %s at byte %s "
+                            "(declared length %s); batch boundary cannot be determined" % (
+                                tp, start_byte, declared_length),
+                            topic=tp.topic, partition=tp.partition,
+                            base_offset=framing_base_offset,
+                            batch_start=start_byte, batch_end=None,
+                            next_offset=None, stage=Errors.STAGE_FRAMING,
+                            boundary_reliable=False)
+                        self.config['corrupt_batch_handler'](framing_error)
+                        raise framing_error
                     if completed_fetch.response_version < 3:
                         # Implement the pre KIP-74 behavior of throwing a RecordTooLargeException.
                         record_too_large_partitions = {tp: fetch_offset}
@@ -1597,6 +1626,7 @@ class Fetcher:
         def __init__(self, fetch_offset, tp, records,
                      key_deserializer=None, value_deserializer=None,
                      check_crcs=True,
+                     corrupt_batch_handler=Errors.default_corrupt_batch_handler,
                      isolation_level=IsolationLevel.READ_UNCOMMITTED,
                      aborted_transactions=None, # AbortedTransaction data from FetchResponse
                      metric_aggregator=None, on_drain=lambda x: None):
@@ -1613,6 +1643,7 @@ class Fetcher:
             )
             self.metric_aggregator = metric_aggregator
             self.check_crcs = check_crcs
+            self.corrupt_batch_handler = corrupt_batch_handler
             self.record_iterator = itertools.dropwhile(
                 self._maybe_skip_record,
                 self._unpack_records(tp, records, key_deserializer, value_deserializer))
@@ -1663,16 +1694,43 @@ class Fetcher:
 
         def _unpack_records(self, tp, records, key_deserializer, value_deserializer):
             try:
-                batch = records.next_batch()
+                batch = self._next_batch(records)
                 last_batch = None
                 while batch is not None:
                     last_batch = batch
 
                     if self.check_crcs and not batch.validate_crc():
-                        raise Errors.CorruptRecordError(
-                                "Record batch for partition %s at offset %s failed crc check" % (
-                                    self.topic_partition, batch.base_offset))
+                        self._raise_or_skip_batch(
+                            records, batch, Errors.STAGE_CRC,
+                            "Record batch for partition %s at offset %s failed crc check" % (
+                                self.topic_partition, batch.base_offset))
+                        batch = self._next_batch(records)
+                        continue
 
+                    # CRC validated the wrapper; now a damaged compressed body
+                    # is distinguishable from record-structure failures.
+                    try:
+                        batch.decompress()
+                    except Errors.UnsupportedCodecError:
+                        # A missing codec is a client configuration problem,
+                        # not corruption the user could quarantine.
+                        raise
+                    except Errors.CorruptRecordError as e:
+                        self._raise_or_skip_batch(
+                            records, batch, Errors.STAGE_DECOMPRESS,
+                            "Unable to decompress record batch for partition %s "
+                            "at offset %s: %s" % (tp, batch.base_offset, e),
+                            cause=e)
+                        batch = self._next_batch(records)
+                        continue
+                    except Exception as e:
+                        self._raise_or_skip_batch(
+                            records, batch, Errors.STAGE_DECOMPRESS,
+                            "Unable to decompress record batch for partition %s "
+                            "at offset %s: %r" % (tp, batch.base_offset, e),
+                            cause=e)
+                        batch = self._next_batch(records)
+                        continue
 
                     # Try DefaultsRecordBatch / message log format v2
                     # base_offset, last_offset_delta, aborted transactions, and control batches
@@ -1695,42 +1753,61 @@ class Fetcher:
                                           " offsets %s to %s",
                                           self.topic_partition, producer_id, batch.base_offset, batch.last_offset)
                                 self.next_fetch_offset = batch.next_offset
-                                batch = records.next_batch()
+                                batch = self._next_batch(records)
                                 continue
 
                         # Control batches have a single record indicating whether a transaction
                         # was aborted or committed. These are not returned to the consumer.
                         if batch.is_control_batch:
                             self.next_fetch_offset = batch.next_offset
-                            batch = records.next_batch()
+                            batch = self._next_batch(records)
                             continue
 
-                    for record in batch:
-                        if self.check_crcs and not record.validate_crc():
-                            raise Errors.CorruptRecordError(
-                                    "Record for partition %s at offset %s failed crc check" % (
-                                        self.topic_partition, record.offset))
-                        key_size = len(record.key) if record.key is not None else -1
-                        value_size = len(record.value) if record.value is not None else -1
-                        key = self._deserialize(key_deserializer, tp.topic, record.headers, record.key)
-                        value = self._deserialize(value_deserializer, tp.topic, record.headers, record.value)
-                        headers = record.headers
-                        header_size = sum(
-                            len(h_key.encode("utf-8")) + (len(h_val) if h_val is not None else 0) for h_key, h_val in
-                            headers) if headers else -1
-                        self.records_read += 1
-                        self.bytes_read += record.size_in_bytes
-                        self.next_fetch_offset = record.offset + 1
-                        yield ConsumerRecord(
-                            tp.topic, tp.partition, self.leader_epoch, record.offset, record.timestamp,
-                            record.timestamp_type, key, value, record.headers, record.checksum,
-                            key_size, value_size, header_size)
+                    skipped = False
+                    try:
+                        for record in batch:
+                            if self.check_crcs and not record.validate_crc():
+                                # Report only the wire-level batch offset; the
+                                # failing internal record's offset cannot be
+                                # trusted and is never fabricated.
+                                self._raise_or_skip_batch(
+                                    records, batch, Errors.STAGE_CRC,
+                                    "Record within batch for partition %s at batch offset %s "
+                                    "failed crc check" % (
+                                        self.topic_partition, batch.base_offset))
+                                skipped = True
+                                break
+                            key_size = len(record.key) if record.key is not None else -1
+                            value_size = len(record.value) if record.value is not None else -1
+                            key = self._deserialize(key_deserializer, tp.topic, record.headers, record.key)
+                            value = self._deserialize(value_deserializer, tp.topic, record.headers, record.value)
+                            headers = record.headers
+                            header_size = sum(
+                                len(h_key.encode("utf-8")) + (len(h_val) if h_val is not None else 0) for h_key, h_val in
+                                headers) if headers else -1
+                            self.records_read += 1
+                            self.bytes_read += record.size_in_bytes
+                            self.next_fetch_offset = record.offset + 1
+                            yield ConsumerRecord(
+                                tp.topic, tp.partition, self.leader_epoch, record.offset, record.timestamp,
+                                record.timestamp_type, key, value, record.headers, record.checksum,
+                                key_size, value_size, header_size)
+                    except Errors.CorruptRecordError as e:
+                        # Undecodable inner record structure. Again we expose
+                        # the batch's wire base offset only.
+                        self._raise_or_skip_batch(
+                            records, batch, Errors.STAGE_RECORDS,
+                            "Failed to parse a record within batch for partition %s "
+                            "at batch offset %s: %s" % (
+                                self.topic_partition, batch.base_offset, e),
+                            cause=e)
+                        skipped = True
 
-                    batch = records.next_batch()
+                    batch = self._next_batch(records)
                 else:
                     # Message format v2 preserves the last offset in a batch even if the last record is removed
                     # through compaction. By using the next offset computed from the last offset in the batch,
-                    # we ensure that the offset of the next fetch will point to the next batch, which avoids
+                    # we ensure the offset of the next fetch will point to the next batch, which avoids
                     # unnecessary re-fetching of the same batch (in the worst case, the consumer could get stuck
                     # fetching the same batch repeatedly).
                     if last_batch and last_batch.magic == 2:
@@ -1743,6 +1820,135 @@ class Fetcher:
             except StopIteration:
                 log.exception('StopIteration raised unpacking messageset')
                 raise RuntimeError('StopIteration raised unpacking messageset')
+
+        def _check_framing(self, records):
+            framing = records.framing_error()
+            if framing is None:
+                return
+            start_byte, declared_length = framing
+            # A complete length header is present and corrupt: the batch end
+            # simply cannot be located. We surface its (still-readable) wire
+            # base offset, but boundary_reliable stays False and skipping is
+            # never allowed, regardless of what the handler returns.
+            try:
+                base_offset = records.base_offset_at(start_byte)
+            except (ValueError, IndexError, struct.error):
+                base_offset = None
+            error = Errors.CorruptBatchError(
+                "Corrupt batch length header for partition %s at byte %s "
+                "(declared length %s); batch boundary cannot be determined" % (
+                    self.topic_partition, start_byte, declared_length),
+                topic=self.topic_partition.topic,
+                partition=self.topic_partition.partition,
+                base_offset=base_offset,
+                batch_start=start_byte,
+                batch_end=None,
+                next_offset=None,
+                stage=Errors.STAGE_FRAMING,
+                boundary_reliable=False)
+            self._decide(error)
+            # Skipping a batch whose end is unknown is unsafe.
+            raise error
+
+        def _next_batch(self, records):
+            try:
+                batch = records.next_batch()
+                if batch is None:
+                    # No complete batch follows. This is either a clean end of
+                    # the buffer or an (unskippable) framing failure; raise the
+                    # structured error for the latter instead of silently
+                    # dropping everything past the damaged length header.
+                    self._check_framing(records)
+                return batch
+            except Errors.CorruptBatchError:
+                raise
+            except Errors.CorruptRecordError as e:
+                # The batch start was framed by an intact length header, but
+                # the declared body is shorter than the minimum record
+                # overhead: boundary bytes are known, the contents are not.
+                raise self._build_batch_error(
+                    records, None, Errors.STAGE_RECORDS, str(e), cause=e,
+                    boundary_reliable=False)
+
+        def _batch_next_offset(self, batch):
+            """Safe resume offset past ``batch``, derived from headers only.
+
+            Returns None when the next offset cannot be known without decoding
+            internal records (a v0 compressed wrapper carries offset 0).
+            Internal record offsets are never invented.
+            """
+            if batch.magic == 2:
+                return batch.next_offset
+            if getattr(batch, "compression_type", 0):
+                # Brokers (0.10+) store the last inner offset as the magic 1
+                # wrapper base offset, so base + 1 resumes past the whole
+                # batch. A wrapper base offset of 0 is ambiguous (it is also
+                # what pre-0.10-style builders write for any range), so the
+                # resume point cannot be derived from the header reliably and
+                # must not be guessed.
+                if batch.magic == 1 and batch.base_offset > 0:
+                    return batch.base_offset + 1
+                return None
+            return batch.base_offset + 1
+
+        def _build_batch_error(self, records, batch, stage, message,
+                               cause=None, boundary_reliable=True):
+            if stage == Errors.STAGE_FRAMING:
+                framing = records.framing_error()
+                batch_start = framing[0] if framing is not None else 0
+                batch_end = None
+            else:
+                batch_range = records.current_batch_range()
+                if batch_range is not None:
+                    batch_start, batch_end = batch_range
+                else:
+                    batch_start, batch_end = 0, None
+            base_offset = batch.base_offset if batch is not None else None
+            if base_offset is None and batch_start is not None:
+                try:
+                    base_offset = records.base_offset_at(batch_start)
+                except (ValueError, IndexError, struct.error):
+                    base_offset = None
+            next_offset = None
+            if boundary_reliable and batch is not None:
+                next_offset = self._batch_next_offset(batch)
+            return Errors.CorruptBatchError(
+                message,
+                topic=self.topic_partition.topic,
+                partition=self.topic_partition.partition,
+                base_offset=base_offset,
+                batch_start=batch_start,
+                batch_end=batch_end,
+                next_offset=next_offset,
+                stage=stage,
+                boundary_reliable=boundary_reliable and next_offset is not None,
+                cause=cause)
+
+        def _decide(self, error):
+            decision = self.corrupt_batch_handler(error)
+            if decision is None:
+                decision = Errors.QUARANTINE_FAIL
+            if decision not in (Errors.QUARANTINE_FAIL,
+                                Errors.QUARANTINE_SKIP_BATCH):
+                raise Errors.KafkaError(
+                    "corrupt_batch_handler returned an invalid decision: %r"
+                    % (decision,))
+            return decision
+
+        def _raise_or_skip_batch(self, records, batch, stage, message,
+                                 cause=None):
+            error = self._build_batch_error(
+                records, batch, stage, message, cause=cause)
+            log.warning("Corrupt record batch for %s at offset %s (stage=%s,"
+                        " bytes %s-%s)", self.topic_partition,
+                        error.base_offset, stage,
+                        error.batch_start, error.batch_end)
+            if self._decide(error) == Errors.QUARANTINE_SKIP_BATCH:
+                if not error.boundary_reliable:
+                    raise error
+                self.next_fetch_offset = error.next_offset
+                return
+            raise error
 
         def _deserialize(self, deserializer, topic, headers, data):
             if deserializer is None:

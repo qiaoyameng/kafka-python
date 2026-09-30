@@ -187,6 +187,83 @@ class CorruptRecordError(BrokerResponseError):
 CorruptRecordException = CorruptRecordError
 
 
+# Failure stages reported by CorruptBatchError. ``STAGE_FRAMING`` is special:
+# when the on-wire length header itself is damaged the end of the batch cannot
+# be located, so batch isolation (skipping) is never permitted.
+STAGE_FRAMING = "framing"
+STAGE_CRC = "crc"
+STAGE_DECOMPRESS = "decompress"
+STAGE_RECORDS = "records"
+
+# Quarantine decisions returned to the corrupt-batch callback.
+QUARANTINE_FAIL = "fail"
+QUARANTINE_SKIP_BATCH = "skip_batch"
+
+
+def default_corrupt_batch_handler(error):
+    """Default isolation decision for a corrupt batch: always fail.
+
+    See :class:`CorruptBatchError` for the callback contract.
+    """
+    return QUARANTINE_FAIL
+
+
+class CorruptBatchError(CorruptRecordError):
+    """Structured error raised when a fetched record batch cannot be parsed.
+
+    Unlike a plain :class:`CorruptRecordError`, this carries enough context
+    for a consumer to make an explicit quarantine decision about the whole
+    batch without guessing:
+
+    Attributes:
+        topic (str): topic of the partition being consumed.
+        partition (int): partition of the batch.
+        base_offset (int or None): wire-level base offset of the batch. It is
+            read straight from the (possibly corrupt) batch header; it is
+            never an inferred offset of an internal record that could not be
+            decoded. May be None only when even the batch start framing is
+            unusable.
+        batch_start (int): byte offset of the batch inside the fetch buffer.
+        batch_end (int or None): byte offset just past the batch inside the
+            fetch buffer, reliably determined from the length header. None
+            when the length header is damaged (``stage == STAGE_FRAMING``).
+        next_offset (int or None): offset to seek to in order to resume just
+            past the whole batch. None unless the batch boundary is reliably
+            known, in which case it is derived from the batch header only
+            (``base_offset + 1`` for legacy formats, ``batch.next_offset``
+            for v2). Internal record offsets are never invented.
+        stage (str): one of STAGE_FRAMING, STAGE_CRC, STAGE_DECOMPRESS or
+            STAGE_RECORDS -- the point at which parsing failed.
+        boundary_reliable (bool): True only when the full extent of the batch
+            is known from an intact length/header; skipping is permitted only
+            in that case.
+        cause (Exception or None): the underlying decode error, if any.
+    """
+
+    def __init__(self, message, topic=None, partition=None, base_offset=None,
+                 batch_start=0, batch_end=None, next_offset=None,
+                 stage=STAGE_RECORDS, boundary_reliable=False, cause=None):
+        super().__init__(message)
+        self.topic = topic
+        self.partition = partition
+        self.base_offset = base_offset
+        self.batch_start = batch_start
+        self.batch_end = batch_end
+        self.next_offset = next_offset
+        self.stage = stage
+        self.boundary_reliable = boundary_reliable
+        self.cause = cause
+
+    def __repr__(self):
+        return (
+            "CorruptBatchError(topic={!r}, partition={!r}, base_offset={!r},"
+            " batch_start={!r}, batch_end={!r}, next_offset={!r}, stage={!r},"
+            " boundary_reliable={!r}, cause={!r})".format(
+                self.topic, self.partition, self.base_offset,
+                self.batch_start, self.batch_end, self.next_offset,
+                self.stage, self.boundary_reliable, self.cause))
+
+
 class UnknownTopicOrPartitionError(InvalidMetadataError, BrokerResponseError):
     errno = 3
     message = 'UNKNOWN_TOPIC_OR_PARTITION'

@@ -332,8 +332,16 @@ class DefaultRecordBatch(DefaultRecordBase, ABCRecordBatch):
                 length, offset, timestamp, self.timestamp_type, key, value, headers)
 
     def __iter__(self):
-        self._maybe_uncompress()
+        self.decompress()
         return self
+
+    def decompress(self):
+        """Decompress the batch payload (no-op for uncompressed batches).
+
+        Raises CorruptRecordError if the compressed body cannot be decoded.
+        Safe to call repeatedly.
+        """
+        self._maybe_uncompress()
 
     def __next__(self):
         if self._next_record_index >= self._num_records:
