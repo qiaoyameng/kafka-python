@@ -83,6 +83,12 @@ class ConsumerCoordinator(BaseCoordinator):
         self._assignment_snapshot = None
         self.auto_commit_interval = self.config['auto_commit_interval_ms'] / 1000
         self.next_auto_commit_deadline = None
+        # Optional callable returning the offsets dict to use for automatic
+        # commits (pre-rebalance, periodic, and close-time). KafkaConsumer
+        # installs one when explicit acknowledgment is supported so that
+        # auto-commit advances acknowledged watermarks instead of consumed
+        # positions. None means: use subscription consumed offsets.
+        self.auto_commit_offset_provider = None
         self.completed_offset_commits = collections.deque()
         self._offset_fetch_futures = dict()
         self._async_commit_fenced = False
@@ -519,7 +525,7 @@ class ConsumerCoordinator(BaseCoordinator):
         if self.config['enable_auto_commit']:
             try:
                 await self._commit_offsets_sync_async(
-                    self._subscription.all_consumed_offsets(),
+                    self._offsets_for_auto_commit(),
                     timeout_ms=timeout_ms)
             except (Errors.UnknownMemberIdError,
                     Errors.IllegalGenerationError,
@@ -871,7 +877,7 @@ class ConsumerCoordinator(BaseCoordinator):
     def _maybe_auto_commit_offsets_sync(self, timeout_ms=None):
         if self.config['enable_auto_commit']:
             try:
-                self.commit_offsets_sync(self._subscription.all_consumed_offsets(), timeout_ms=timeout_ms)
+                self.commit_offsets_sync(self._offsets_for_auto_commit(), timeout_ms=timeout_ms)
 
             # The three main group membership errors are known and should not
             # require a stacktrace -- just a warning
@@ -1199,8 +1205,13 @@ class ConsumerCoordinator(BaseCoordinator):
             self._do_auto_commit_offsets_async()
 
     def _do_auto_commit_offsets_async(self):
-        self.commit_offsets_async(self._subscription.all_consumed_offsets(),
+        self.commit_offsets_async(self._offsets_for_auto_commit(),
                                   self._commit_offsets_async_on_complete)
+
+    def _offsets_for_auto_commit(self):
+        if self.auto_commit_offset_provider is not None:
+            return self.auto_commit_offset_provider()
+        return self._subscription.all_consumed_offsets()
 
 
 class ConsumerCoordinatorMetrics:

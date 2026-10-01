@@ -75,6 +75,18 @@ class SubscriptionState:
         self.listeners = []
         self._lock = threading.RLock()
 
+    def _notify_seek(self, partition):
+        # Internal listeners (e.g. the consumer's AckTracker); not the
+        # user-facing rebalance_listener.
+        for listener in self.listeners:
+            listener.on_seek(partition)
+
+    def _notify_partitions_dropped(self, partitions):
+        if not partitions:
+            return
+        for listener in self.listeners:
+            listener.on_partitions_dropped(partitions)
+
     def _set_subscription_type(self, subscription_type):
         if not isinstance(subscription_type, SubscriptionType):
             raise ValueError('SubscriptionType enum required')
@@ -287,9 +299,11 @@ class SubscriptionState:
         new_set = set(partitions)
         # Drop revoked partitions (we mutate self.assignment, so list()
         # the keys first to avoid "dict changed size during iteration").
+        dropped = []
         for tp in list(self.assignment.keys()):
             if tp not in new_set:
                 del self.assignment[tp]
+                dropped.append(tp)
             else:
                 # Retained partitions are no longer pending_revocation
                 self.assignment[tp].mark_pending_revocation(False)
@@ -301,15 +315,18 @@ class SubscriptionState:
             random.shuffle(new_partitions)
         for tp in new_partitions:
             self.assignment[tp] = TopicPartitionState()
+        self._notify_partitions_dropped(dropped)
 
     @synchronized
     def unsubscribe(self):
         """Clear all topic subscriptions and partition assignments"""
+        dropped = list(self.assignment.keys())
         self.subscription = None
         self._user_assignment.clear()
         self.assignment.clear()
         self.subscribed_pattern = None
         self.subscription_type = SubscriptionType.NONE
+        self._notify_partitions_dropped(dropped)
 
     @synchronized
     def group_subscription(self):
@@ -344,6 +361,7 @@ class SubscriptionState:
         if not isinstance(offset, (int, OffsetAndMetadata)):
             raise TypeError("offset must be type in or OffsetAndMetadata")
         self.assignment[partition].seek(offset)
+        self._notify_seek(partition)
 
     @synchronized
     def assigned_partitions(self):

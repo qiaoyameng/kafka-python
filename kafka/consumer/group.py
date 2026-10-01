@@ -1,4 +1,5 @@
 import copy
+import inspect
 import logging
 import re
 import selectors
@@ -8,8 +9,10 @@ import time
 import kafka.errors as Errors
 from kafka.errors import KafkaConfigurationError, UnsupportedVersionError
 
+from kafka.consumer.acknowledgment import AckTracker
 from kafka.consumer.fetcher import Fetcher
-from kafka.consumer.subscription_state import SubscriptionState
+from kafka.consumer.subscription_state import (
+    ConsumerRebalanceListener, SubscriptionState)
 from kafka.coordinator.consumer import ConsumerCoordinator
 from kafka.coordinator.assignors.range import RangePartitionAssignor
 from kafka.coordinator.assignors.roundrobin import RoundRobinPartitionAssignor
@@ -21,6 +24,41 @@ from kafka.util import Timer
 from kafka.version import __version__
 
 log = logging.getLogger(__name__)
+
+
+class _AckInvalidatingRebalanceListener(ConsumerRebalanceListener):
+    """Internal rebalance listener wrapping the user's listener.
+
+    Invalidates outstanding ack handles for revoked / lost partitions
+    (so stale handles can no longer be resolved after a rebalance),
+    then forwards the callback to the user's listener if one was
+    supplied to subscribe(). Methods are async so the coordinator
+    awaits them; user callbacks may be sync or async.
+    """
+
+    def __init__(self, ack_tracker, user_listener=None):
+        self._ack_tracker = ack_tracker
+        self._user_listener = user_listener
+
+    async def on_partitions_revoked(self, revoked):
+        self._ack_tracker.on_partitions_dropped(revoked)
+        if self._user_listener is not None:
+            await self._forward(self._user_listener.on_partitions_revoked, revoked)
+
+    async def on_partitions_assigned(self, assigned):
+        if self._user_listener is not None:
+            await self._forward(self._user_listener.on_partitions_assigned, assigned)
+
+    async def on_partitions_lost(self, lost):
+        self._ack_tracker.on_partitions_dropped(lost)
+        if self._user_listener is not None:
+            await self._forward(self._user_listener.on_partitions_lost, lost)
+
+    @staticmethod
+    async def _forward(callback, partitions):
+        result = callback(partitions)
+        if inspect.isawaitable(result):
+            await result
 
 
 class KafkaConsumer:
@@ -493,18 +531,26 @@ class KafkaConsumer:
                 raise KafkaConfigurationError("group_instance_id requires group_id")
 
         self._subscription = SubscriptionState(self.config['auto_offset_reset'])
+        self._ack_tracker = AckTracker()
+        self._subscription.listeners.append(self._ack_tracker)
         self._fetcher = Fetcher(
             self._client, self._subscription, metrics=self._metrics, **self.config)
         self._coordinator = ConsumerCoordinator(
             self._client, self._subscription, metrics=self._metrics,
             assignors=self.config['partition_assignment_strategy'],
             **self.config)
+        # Once explicit acknowledgment is in use, all automatic commit
+        # paths must commit acknowledged watermarks instead of consumed
+        # positions, so in-flight records are never implicitly skipped.
+        self._coordinator.auto_commit_offset_provider = self._committable_offsets
         self._closed = False
         self._iterator = None
         self._consumer_timeout = float('inf')
 
         if topics:
-            self._subscription.subscribe(topics=topics)
+            self._subscription.subscribe(
+                topics=topics,
+                listener=_AckInvalidatingRebalanceListener(self._ack_tracker))
             self._cluster.set_topics(topics)
 
     def _validate_group_instance_id(self, group_instance_id):
@@ -605,6 +651,73 @@ class KafkaConsumer:
         # an unprocessed message on next start. Clean exits commit normally.
         self.close(autocommit=exc_type is None)
 
+    def acknowledge(self, record):
+        """Register a consumed record for explicit acknowledgment.
+
+        Returns an :class:`~kafka.consumer.acknowledgment.Acknowledgment`
+        handle that the caller (typically a worker thread processing the
+        record in parallel) resolves once processing finishes:
+
+        - ``handle.ack()``: record processed successfully.
+        - ``handle.fail()``: processing failed; the offset stays an
+          unresolved gap so it can be redelivered later (a failed handle
+          may still be abandoned explicitly).
+        - ``handle.abandon()``: explicitly skip the record, allowing the
+          commit watermark to advance past it.
+
+        The per-partition commit watermark only advances over a
+        contiguous run of resolved offsets, so completing offset 12
+        never commits past a still-pending offset 11. Handles are
+        invalidated by :meth:`seek`, partition revocation, and
+        reassignment; resolving a stale handle raises
+        ``IllegalStateError``.
+
+        Arguments:
+            record (ConsumerRecord): a record returned by this consumer.
+
+        Raises:
+            ValueError: if the record's partition is not currently assigned.
+        """
+        tp = TopicPartition(record.topic, record.partition)
+        if tp not in self._subscription.assignment:
+            raise ValueError('Unassigned partition: %s' % (tp,))
+        return self._ack_tracker.begin(tp, record.offset)
+
+    def _committable_offsets(self):
+        """Offsets to commit right now: acknowledged watermarks once
+        explicit acknowledgment is in use, else consumed positions."""
+        if self._ack_tracker.active:
+            return self._ack_tracker.acknowledged_offsets()
+        return self._subscription.all_consumed_offsets()
+
+    def commit_acknowledged(self, timeout_ms=None):
+        """Commit only the contiguous acknowledged prefix of each partition.
+
+        For every partition, commits the end of the run of offsets whose
+        handles were resolved with ``ack()`` (or explicitly skipped with
+        ``abandon()``). Offsets still pending or marked ``fail()`` leave
+        a gap: the watermark stops before them and later completions are
+        not committed. Partitions with no resolved offsets are skipped.
+
+        Keyword Arguments:
+            timeout_ms (numeric, optional): Maximum time in milliseconds to
+                block. Defaults to default_api_timeout_ms.
+
+        Raises:
+            IncompatibleBrokerVersion: if broker version < 0.8.1
+            IllegalStateError: if group_id is None
+        """
+        if self.config['api_version'] < (0, 8, 1):
+            raise Errors.IncompatibleBrokerVersion('Requires >= Kafka 0.8.1')
+        if self.config['group_id'] is None:
+            raise Errors.IllegalStateError('Requires group_id')
+        offsets = self._ack_tracker.acknowledged_offsets()
+        if not offsets:
+            log.debug("commit_acknowledged: no acknowledged offsets to commit")
+            return
+        log.debug("Committing acknowledged offsets: %s", offsets)
+        self._coordinator.commit_offsets_sync(offsets, timeout_ms=timeout_ms)
+
     def close(self, autocommit=True, timeout_ms=None):
         """Close the consumer, attempting any needed cleanup within a bounded
         wall-clock budget.
@@ -628,7 +741,17 @@ class KafkaConsumer:
         # close() until process exit.
         if timeout_ms is None:
             timeout_ms = self.config['request_timeout_ms']
-        self._coordinator.close(autocommit=autocommit, timeout_ms=timeout_ms)
+        # Explicit-acknowledgment mode: commit only the acknowledged
+        # prefix, never the consumed position, so in-flight records are
+        # not implicitly skipped on close.
+        if autocommit and self._ack_tracker.active and self.config['group_id'] is not None:
+            try:
+                self.commit_acknowledged(timeout_ms=timeout_ms)
+            except Exception as exc:  # pylint: disable=broad-except
+                log.warning("Acknowledged-offset commit on close failed: %s", exc)
+            self._coordinator.close(autocommit=False, timeout_ms=timeout_ms)
+        else:
+            self._coordinator.close(autocommit=autocommit, timeout_ms=timeout_ms)
         if self._metrics:
             self._metrics.close()
         self._client.close()
@@ -658,7 +781,9 @@ class KafkaConsumer:
         Arguments:
             offsets (dict, optional): {TopicPartition: OffsetAndMetadata} dict
                 to commit with the configured group_id. Defaults to currently
-                consumed offsets for all subscribed partitions.
+                consumed offsets for all subscribed partitions -- or, once
+                explicit acknowledgment is in use (see :meth:`acknowledge`),
+                to the contiguous acknowledged watermarks.
             callback (callable, optional): Called as callback(offsets, response)
                 with response as either an Exception or an OffsetCommitResponse
                 struct. This callback can be used to trigger custom actions when
@@ -676,7 +801,7 @@ class KafkaConsumer:
         if self.config['group_id'] is None:
             raise Errors.IllegalStateError('Requires group_id')
         if offsets is None:
-            offsets = self._subscription.all_consumed_offsets()
+            offsets = self._committable_offsets()
         log.debug("Committing offsets: %s", offsets)
         future = self._coordinator.commit_offsets_async(
             offsets, callback=callback)
@@ -700,7 +825,9 @@ class KafkaConsumer:
         Arguments:
             offsets (dict, optional): {TopicPartition: OffsetAndMetadata} dict
                 to commit with the configured group_id. Defaults to currently
-                consumed offsets for all subscribed partitions.
+                consumed offsets for all subscribed partitions -- or, once
+                explicit acknowledgment is in use (see :meth:`acknowledge`),
+                to the contiguous acknowledged watermarks.
             timeout_ms (numeric, optional): Maximum time in milliseconds to
                 block. Defaults to default_api_timeout_ms.
 
@@ -717,7 +844,7 @@ class KafkaConsumer:
         if self.config['group_id'] is None:
             raise Errors.IllegalStateError('Requires group_id')
         if offsets is None:
-            offsets = self._subscription.all_consumed_offsets()
+            offsets = self._committable_offsets()
         self._coordinator.commit_offsets_sync(offsets, timeout_ms=timeout_ms)
 
     def group_metadata(self):
@@ -1076,7 +1203,9 @@ class KafkaConsumer:
         if partition not in self._subscription.assigned_partitions():
             raise ValueError('Unassigned partition')
         log.debug("Seeking to offset %s for partition %s", offset, partition)
-        self._subscription.assignment[partition].seek(offset)
+        # Route through SubscriptionState.seek so internal listeners
+        # (the ack tracker) invalidate outstanding ack handles.
+        self._subscription.seek(partition, offset)
         self._iterator = None
 
     def seek_to_beginning(self, *partitions):
@@ -1103,6 +1232,7 @@ class KafkaConsumer:
 
         for tp in partitions:
             log.debug("Seeking to beginning of partition %s", tp)
+            self._ack_tracker.invalidate(tp)
             self._subscription.request_offset_reset(tp, OffsetResetStrategy.EARLIEST)
         self._iterator = None
 
@@ -1130,6 +1260,7 @@ class KafkaConsumer:
 
         for tp in partitions:
             log.debug("Seeking to end of partition %s", tp)
+            self._ack_tracker.invalidate(tp)
             self._subscription.request_offset_reset(tp, OffsetResetStrategy.LATEST)
         self._iterator = None
 
@@ -1177,7 +1308,8 @@ class KafkaConsumer:
         # SubscriptionState handles error checking
         self._subscription.subscribe(topics=topics,
                                      pattern=pattern,
-                                     listener=listener)
+                                     listener=_AckInvalidatingRebalanceListener(
+                                         self._ack_tracker, listener))
 
         # Regex will need all topic metadata
         if pattern is not None:
