@@ -896,7 +896,8 @@ class KafkaProducer:
         self._sender.wakeup()
         result.wait()
 
-    def send(self, topic, value=None, key=None, headers=None, partition=None, timestamp_ms=None):
+    def send(self, topic, value=None, key=None, headers=None, partition=None, timestamp_ms=None,
+             isolation_key=None):
         """Publish a message to a topic.
 
         Arguments:
@@ -921,6 +922,19 @@ class KafkaProducer:
                 are tuples of str key and bytes value.
             timestamp_ms (int, optional): epoch milliseconds (from Jan 1 1970 UTC)
                 to use as the message timestamp. Defaults to current time.
+            isolation_key (hashable, optional): Optional batch-isolation key.
+                Records sent to the same partition with different
+                isolation_keys are never compressed into the same producer
+                batch. When the value changes relative to the partition's
+                in-progress batch, that batch is sealed immediately
+                (regardless of linger_ms or remaining batch_size room) and a
+                new batch is allocated. Sealed batches keep FIFO order in the
+                partition's queue, so a later record with an earlier key can
+                never merge across the intervening record, and send ordering
+                and Future completion ordering are unchanged. The
+                isolation_key does not affect partition assignment; use the
+                normal ``key`` argument (or an explicit ``partition``) to
+                route records. Defaults to None (no isolation).
 
         Returns:
             FutureRecordMetadata: resolves to RecordMetadata
@@ -996,7 +1010,8 @@ class KafkaProducer:
         # the next one.
         sticky_eligible = not explicit_partition and key_bytes is None
         result = self._accumulator.append(tp, timestamp_ms, key_bytes, value_bytes, headers,
-                                          abort_on_new_batch=sticky_eligible)
+                                          abort_on_new_batch=sticky_eligible,
+                                          isolation_key=isolation_key)
         future, batch_is_full, new_batch_created, abort_for_new_batch = result
         if abort_for_new_batch:
             prev_partition = partition
@@ -1009,7 +1024,8 @@ class KafkaProducer:
             if self._transaction_manager and self._transaction_manager.is_transactional():
                 self._transaction_manager.maybe_add_partition_to_transaction(tp)
             result = self._accumulator.append(tp, timestamp_ms, key_bytes, value_bytes, headers,
-                                              abort_on_new_batch=False)
+                                              abort_on_new_batch=False,
+                                              isolation_key=isolation_key)
             future, batch_is_full, new_batch_created, _ = result
 
         if batch_is_full or new_batch_created:

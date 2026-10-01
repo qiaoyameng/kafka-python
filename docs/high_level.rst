@@ -99,6 +99,13 @@ KafkaProducer
     # produce keyed messages to enable hashed partitioning
     producer.send('keyed-topic', key=b'foo', value=b'bar')
 
+    # keep sensitive records with different isolation keys out of the same
+    # compressed batch, while still routing to one partition in send order
+    producer.send('secure-topic', key=b'user-42', value=b'a',
+                  isolation_key='tenant-a')
+    producer.send('secure-topic', key=b'user-42', value=b'b',
+                  isolation_key='tenant-b')  # seals the tenant-a batch
+
     # encode str with utf-8 encoding
     producer = KafkaProducer(value_serializer=DefaultSerializer())
     producer.send('utf-8-topic', 'value_str')

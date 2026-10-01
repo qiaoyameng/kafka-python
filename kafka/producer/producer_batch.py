@@ -16,7 +16,7 @@ class FinalState(IntEnum):
 
 
 class ProducerBatch:
-    def __init__(self, tp, records, now=None):
+    def __init__(self, tp, records, now=None, isolation_key=None):
         now = time.monotonic() if now is None else now
         self.max_record_size = 0
         self.created = now
@@ -30,6 +30,10 @@ class ProducerBatch:
         self._record_futures = []
         self._retry = False
         self._final_state = None
+        # Batch isolation key: records with different keys never share a
+        # batch (and hence never share a compression unit). None disables
+        # isolation for this batch.
+        self.isolation_key = isolation_key
 
     @property
     def final_state(self):

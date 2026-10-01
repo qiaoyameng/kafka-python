@@ -111,7 +111,7 @@ class RecordAccumulator:
         return self._tp_locks[tp]
 
     def append(self, tp, timestamp_ms, key, value, headers, now=None,
-               abort_on_new_batch=False):
+               abort_on_new_batch=False, isolation_key=None):
         """Add a record to the accumulator, return the append result.
 
         The append result will contain the future metadata, and flag for
@@ -129,6 +129,19 @@ class RecordAccumulator:
                 batch when no in-progress batch has room. Caller is expected
                 to consult the partitioner's ``on_new_batch`` hook, re-pick
                 the partition, and retry with ``abort_on_new_batch=False``.
+            isolation_key (hashable, optional): When provided, the record may
+                only share a batch with records carrying the *same*
+                isolation_key. If the partition's in-progress batch was
+                created for a different key (or the record has a key and the
+                open batch has none), the current batch is sealed and a new
+                one is allocated, even if linger_ms has not elapsed or the
+                batch still has room. The sealed batch retains its position in
+                the partition's FIFO deque, so send order is preserved and a
+                later record with the old key can never merge across the
+                intervening record. At most one open (tail) batch exists per
+                partition, so isolation never multiplies per-partition buffer
+                usage beyond the same sealed-batch queue that batch_size
+                produces.
 
         Returns:
             tuple: (future, batch_is_full, new_batch_created, abort_for_new_batch)
@@ -142,17 +155,28 @@ class RecordAccumulator:
         # not miss batches in abortIncompleteBatches().
         self._appends_in_progress.increment()
         try:
+            # Set when the only reason we cannot reuse the tail batch is an
+            # isolation-key switch. Such a new batch must land on the *same*
+            # partition, so the KIP-480 sticky-partition rotation is skipped
+            # even when abort_on_new_batch=True.
+            isolation_switched = False
             with self._tp_lock(tp):
                 # check if we have an in-progress batch
                 dq = self._batches[tp]
                 if dq:
                     last = dq[-1]
-                    future = last.try_append(timestamp_ms, key, value, headers, now=now)
-                    if future is not None:
-                        batch_is_full = len(dq) > 1 or last.records.is_full()
-                        return future, batch_is_full, False, False
+                    if last.isolation_key != isolation_key:
+                        isolation_switched = True
+                    else:
+                        future = last.try_append(timestamp_ms, key, value, headers, now=now)
+                        if future is not None:
+                            batch_is_full = len(dq) > 1 or last.records.is_full()
+                            return future, batch_is_full, False, False
+                    # Either the isolation key changed (the old batch must be
+                    # sealed and stay behind in FIFO order) or the tail batch
+                    # is full: fall through to allocate a new batch.
 
-            if abort_on_new_batch:
+            if abort_on_new_batch and not isolation_switched:
                 # KIP-480: don't allocate a new batch yet. Caller will
                 # rotate the sticky partition and retry.
                 return None, False, False, True
@@ -165,12 +189,18 @@ class RecordAccumulator:
 
                 if dq:
                     last = dq[-1]
-                    future = last.try_append(timestamp_ms, key, value, headers, now=now)
-                    if future is not None:
-                        # Somebody else found us a batch, return the one we
-                        # waited for! Hopefully this doesn't happen often...
-                        batch_is_full = len(dq) > 1 or last.records.is_full()
-                        return future, batch_is_full, False, False
+                    if last.isolation_key != isolation_key:
+                        isolation_switched = True
+                    else:
+                        future = last.try_append(timestamp_ms, key, value, headers, now=now)
+                        if future is not None:
+                            # Somebody else found us a batch, return the one we
+                            # waited for! Hopefully this doesn't happen often...
+                            batch_is_full = len(dq) > 1 or last.records.is_full()
+                            return future, batch_is_full, False, False
+                    # Isolation key switched while we waited for the lock (or
+                    # the tail filled): seal it implicitly by leaving it in
+                    # the deque and allocate a fresh batch below.
 
                 if self._transaction_manager and self.config['message_version'] < 2:
                     raise Errors.UnsupportedVersionError("Attempting to use idempotence with a broker which"
@@ -182,7 +212,8 @@ class RecordAccumulator:
                     self.config['batch_size']
                 )
 
-                batch = ProducerBatch(tp, records, now=now)
+                batch = ProducerBatch(tp, records, now=now,
+                                      isolation_key=isolation_key)
                 future = batch.try_append(timestamp_ms, key, value, headers, now=now)
                 if not future:
                     raise Exception()
@@ -271,7 +302,8 @@ class RecordAccumulator:
                 self.config['compression_attrs'],
                 self.config['batch_size'],
             )
-            current_batch = ProducerBatch(tp, builder, now=now)
+            current_batch = ProducerBatch(tp, builder, now=now,
+                                          isolation_key=batch.isolation_key)
             current_batch.created = batch.created
 
             for record in group:
@@ -285,7 +317,8 @@ class RecordAccumulator:
                         self.config['compression_attrs'],
                         self.config['batch_size'],
                     )
-                    current_batch = ProducerBatch(tp, builder, now=now)
+                    current_batch = ProducerBatch(tp, builder, now=now,
+                                                  isolation_key=batch.isolation_key)
                     current_batch.created = batch.created
                     metadata = builder.append(record.timestamp, record.key, record.value, record.headers)
 
