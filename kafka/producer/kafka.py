@@ -263,6 +263,13 @@ class KafkaProducer:
             blocked either because the buffer is full or metadata unavailable.
             Blocking in the user-supplied serializers or partitioner will not be
             counted against this timeout. Default: 60000.
+        max_open_batches_per_partition (int): Maximum number of undrained
+            record batches buffered per partition. When the limit is reached
+            (e.g. because batch isolation keys force additional batches while
+            the broker is slow), :meth:`~kafka.KafkaProducer.send` blocks up
+            to max_block_ms waiting for the sender to drain a batch, then
+            raises KafkaTimeoutError. This bounds per-partition buffering.
+            Default: 128
         max_request_size (int): The maximum size of a request. This is also
             effectively a cap on the maximum record size. Note that the server
             has its own cap on record size which may be different from this.
@@ -445,6 +452,7 @@ class KafkaProducer:
         'partitioner': DefaultPartitioner(),
         'connections_max_idle_ms': 9 * 60 * 1000,
         'max_block_ms': 60000,
+        'max_open_batches_per_partition': 128,
         'max_request_size': 1048576,
         'allow_auto_create_topics': True,
         'metadata_max_age_ms': 300000,
@@ -896,7 +904,8 @@ class KafkaProducer:
         self._sender.wakeup()
         result.wait()
 
-    def send(self, topic, value=None, key=None, headers=None, partition=None, timestamp_ms=None):
+    def send(self, topic, value=None, key=None, headers=None, partition=None, timestamp_ms=None,
+             batch_isolation=None):
         """Publish a message to a topic.
 
         Arguments:
@@ -921,6 +930,17 @@ class KafkaProducer:
                 are tuples of str key and bytes value.
             timestamp_ms (int, optional): epoch milliseconds (from Jan 1 1970 UTC)
                 to use as the message timestamp. Defaults to current time.
+            batch_isolation (optional): Batch isolation key. Records sent
+                with different isolation values are never placed in the same
+                record batch (and hence never share a compressed batch),
+                while still being delivered to the same partition in send
+                order. When the isolation value differs from the partition's
+                current open batch, that batch is sealed and a new batch is
+                started; a later record is never merged into an earlier
+                batch past intervening records with a different isolation
+                value. The value is only compared for equality locally and
+                is never sent to the broker. Default: None (all records may
+                share batches, the historical behavior).
 
         Returns:
             FutureRecordMetadata: resolves to RecordMetadata
@@ -993,10 +1013,13 @@ class KafkaProducer:
         # accumulator would have to allocate a fresh batch for this partition,
         # rotate the sticky partition first and re-pick. The record that
         # *triggers* the new batch then lands on the rotated partition, not
-        # the next one.
-        sticky_eligible = not explicit_partition and key_bytes is None
+        # the next one. Isolation-keyed records are excluded: they must stay
+        # on the partition chosen for them so that send order is preserved
+        # across isolation switches.
+        sticky_eligible = not explicit_partition and key_bytes is None and batch_isolation is None
         result = self._accumulator.append(tp, timestamp_ms, key_bytes, value_bytes, headers,
-                                          abort_on_new_batch=sticky_eligible)
+                                          abort_on_new_batch=sticky_eligible,
+                                          isolation=batch_isolation)
         future, batch_is_full, new_batch_created, abort_for_new_batch = result
         if abort_for_new_batch:
             prev_partition = partition
@@ -1009,7 +1032,8 @@ class KafkaProducer:
             if self._transaction_manager and self._transaction_manager.is_transactional():
                 self._transaction_manager.maybe_add_partition_to_transaction(tp)
             result = self._accumulator.append(tp, timestamp_ms, key_bytes, value_bytes, headers,
-                                              abort_on_new_batch=False)
+                                              abort_on_new_batch=False,
+                                              isolation=batch_isolation)
             future, batch_is_full, new_batch_created, _ = result
 
         if batch_is_full or new_batch_created:

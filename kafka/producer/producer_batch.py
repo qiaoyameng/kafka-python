@@ -16,7 +16,7 @@ class FinalState(IntEnum):
 
 
 class ProducerBatch:
-    def __init__(self, tp, records, now=None):
+    def __init__(self, tp, records, now=None, isolation=None):
         now = time.monotonic() if now is None else now
         self.max_record_size = 0
         self.created = now
@@ -26,6 +26,9 @@ class ProducerBatch:
         self.last_append = now
         self.records = records
         self.topic_partition = tp
+        # Batch isolation key: records may only be appended to a batch whose
+        # isolation value equals their own. Never sent to the broker.
+        self.isolation = isolation
         self.produce_future = FutureProduceResult(tp)
         self._record_futures = []
         self._retry = False

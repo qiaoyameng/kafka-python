@@ -61,6 +61,14 @@ class RecordAccumulator:
         retry_backoff_ms (int): An artificial delay time to retry the
             produce request upon receiving an error. This avoids exhausting
             all retries in a short period of time. Default: 100
+        max_block_ms (int): Maximum time to block in ``append`` when the
+            per-partition batch buffer is full. Default: 60000
+        max_open_batches_per_partition (int): Maximum number of undrained
+            batches buffered per partition. Once the limit is reached,
+            ``append`` blocks (up to ``max_block_ms``) until the sender
+            drains a batch, so features that force additional batches (such
+            as batch isolation keys) cannot grow per-partition buffering
+            without bound. Default: 128
     """
     DEFAULT_CONFIG = {
         'batch_size': 16384,
@@ -71,6 +79,8 @@ class RecordAccumulator:
         'retry_backoff_ms': 100,
         'transaction_manager': None,
         'message_version': 2,
+        'max_block_ms': 60000,
+        'max_open_batches_per_partition': 128,
     }
 
     def __init__(self, **configs):
@@ -86,6 +96,10 @@ class RecordAccumulator:
         self._batches = collections.defaultdict(collections.deque) # TopicPartition: [ProducerBatch]
         self._tp_locks = {None: threading.Lock()} # TopicPartition: Lock, plus a lock to add entries
         self._incomplete = IncompleteProducerBatches()
+        # Signalled whenever a batch leaves a partition deque (drained,
+        # expired, or aborted) so appends blocked on
+        # max_open_batches_per_partition can re-check.
+        self._batch_slot_freed = threading.Condition()
         # The following variables should only be accessed by the sender thread,
         # so we don't need to protect them w/ locking.
         self.muted = set()
@@ -111,7 +125,7 @@ class RecordAccumulator:
         return self._tp_locks[tp]
 
     def append(self, tp, timestamp_ms, key, value, headers, now=None,
-               abort_on_new_batch=False):
+               abort_on_new_batch=False, isolation=None):
         """Add a record to the accumulator, return the append result.
 
         The append result will contain the future metadata, and flag for
@@ -129,9 +143,24 @@ class RecordAccumulator:
                 batch when no in-progress batch has room. Caller is expected
                 to consult the partitioner's ``on_new_batch`` hook, re-pick
                 the partition, and retry with ``abort_on_new_batch=False``.
+            isolation (optional): Batch isolation key. A record is only
+                appended to the partition's current (last) batch when that
+                batch's isolation value equals this one; otherwise the
+                current batch is sealed and a new batch is created behind
+                it. Because records only ever join the tail batch, a later
+                record can never be merged into an earlier batch past
+                intervening records with a different isolation value, and
+                per-partition send order is preserved. The value is a local
+                batching hint only -- it is never written to the record or
+                sent to the broker.
 
         Returns:
             tuple: (future, batch_is_full, new_batch_created, abort_for_new_batch)
+
+        Raises:
+            KafkaTimeoutError: if the partition already buffers
+                ``max_open_batches_per_partition`` undrained batches and no
+                batch is drained within ``max_block_ms``.
         """
         if not isinstance(tp, TopicPartition):
             raise TypeError('not TopicPartition')
@@ -142,57 +171,80 @@ class RecordAccumulator:
         # not miss batches in abortIncompleteBatches().
         self._appends_in_progress.increment()
         try:
-            with self._tp_lock(tp):
-                # check if we have an in-progress batch
-                dq = self._batches[tp]
-                if dq:
-                    last = dq[-1]
-                    future = last.try_append(timestamp_ms, key, value, headers, now=now)
-                    if future is not None:
-                        batch_is_full = len(dq) > 1 or last.records.is_full()
-                        return future, batch_is_full, False, False
+            max_open_batches = self.config['max_open_batches_per_partition']
+            deadline = time.monotonic() + self.config['max_block_ms'] / 1000.0
+            while True:
+                with self._tp_lock(tp):
+                    # Need to check if producer is closed again after
+                    # grabbing the dequeue lock.
+                    if self._closed:
+                        raise Errors.IllegalStateError('RecordAccumulator is closed')
 
-            if abort_on_new_batch:
-                # KIP-480: don't allocate a new batch yet. Caller will
-                # rotate the sticky partition and retry.
-                return None, False, False, True
+                    # check if we have an in-progress batch
+                    dq = self._batches[tp]
+                    if dq:
+                        last = dq[-1]
+                        # Isolation: only the tail batch is ever appended
+                        # to, and only when its isolation value matches.
+                        # A mismatch seals the current batch -- the record
+                        # (and any later record with the same isolation
+                        # value) must go into a new batch behind it, never
+                        # into an earlier batch past intervening records.
+                        if last.isolation == isolation:
+                            future = last.try_append(timestamp_ms, key, value, headers, now=now)
+                            if future is not None:
+                                batch_is_full = len(dq) > 1 or last.records.is_full()
+                                return future, batch_is_full, False, False
 
-            with self._tp_lock(tp):
-                # Need to check if producer is closed again after grabbing the
-                # dequeue lock.
-                if self._closed:
-                    raise Errors.IllegalStateError('RecordAccumulator is closed')
+                    if len(dq) < max_open_batches:
+                        if abort_on_new_batch:
+                            # KIP-480: don't allocate a new batch yet. Caller
+                            # will rotate the sticky partition and retry.
+                            return None, False, False, True
 
-                if dq:
-                    last = dq[-1]
-                    future = last.try_append(timestamp_ms, key, value, headers, now=now)
-                    if future is not None:
-                        # Somebody else found us a batch, return the one we
-                        # waited for! Hopefully this doesn't happen often...
-                        batch_is_full = len(dq) > 1 or last.records.is_full()
-                        return future, batch_is_full, False, False
+                        if self._transaction_manager and self.config['message_version'] < 2:
+                            raise Errors.UnsupportedVersionError("Attempting to use idempotence with a broker which"
+                                                                 " does not support the required message format (v2)."
+                                                                 " The broker must be version 0.11 or later.")
+                        records = MemoryRecordsBuilder(
+                            self.config['message_version'],
+                            self.config['compression_attrs'],
+                            self.config['batch_size']
+                        )
 
-                if self._transaction_manager and self.config['message_version'] < 2:
-                    raise Errors.UnsupportedVersionError("Attempting to use idempotence with a broker which"
-                                                         " does not support the required message format (v2)."
-                                                         " The broker must be version 0.11 or later.")
-                records = MemoryRecordsBuilder(
-                    self.config['message_version'],
-                    self.config['compression_attrs'],
-                    self.config['batch_size']
-                )
+                        batch = ProducerBatch(tp, records, now=now, isolation=isolation)
+                        future = batch.try_append(timestamp_ms, key, value, headers, now=now)
+                        if not future:
+                            raise Exception()
 
-                batch = ProducerBatch(tp, records, now=now)
-                future = batch.try_append(timestamp_ms, key, value, headers, now=now)
-                if not future:
-                    raise Exception()
+                        dq.append(batch)
+                        self._incomplete.add(batch)
+                        batch_is_full = len(dq) > 1 or batch.records.is_full()
+                        return future, batch_is_full, True, False
 
-                dq.append(batch)
-                self._incomplete.add(batch)
-                batch_is_full = len(dq) > 1 or batch.records.is_full()
-                return future, batch_is_full, True, False
+                # The partition's buffer is full: a new batch is needed but
+                # the deque already holds max_open_batches undrained
+                # batches. KIP-480 callers never block -- they rotate the
+                # sticky partition instead.
+                if abort_on_new_batch:
+                    return None, False, False, True
+                timeout = deadline - time.monotonic()
+                if timeout <= 0:
+                    raise Errors.KafkaTimeoutError(
+                        'Partition %s already buffers %d undrained batches'
+                        ' (max_open_batches_per_partition); no batch was'
+                        ' drained within max_block_ms (%d ms)' % (
+                            tp, max_open_batches, self.config['max_block_ms']))
+                # Wait (without holding the partition lock, so the sender
+                # thread can drain) for a batch slot to be freed.
+                with self._batch_slot_freed:
+                    self._batch_slot_freed.wait(timeout)
         finally:
             self._appends_in_progress.decrement()
+
+    def _notify_batch_slot_freed(self):
+        with self._batch_slot_freed:
+            self._batch_slot_freed.notify_all()
 
     def reset_next_batch_expiry_time(self):
         self._next_batch_expiry_time_ms = float('inf')
@@ -218,6 +270,8 @@ class RecordAccumulator:
                         # Stop at the first batch that has not expired.
                         self.maybe_update_next_batch_expiry_time(batch)
                         break
+        if expired_batches:
+            self._notify_batch_slot_freed()
         return expired_batches
 
     def split_and_reenqueue(self, batch, now=None):
@@ -271,7 +325,10 @@ class RecordAccumulator:
                 self.config['compression_attrs'],
                 self.config['batch_size'],
             )
-            current_batch = ProducerBatch(tp, builder, now=now)
+            # Split halves inherit the original batch's isolation key: every
+            # record in the source batch shares one isolation value, so the
+            # split batches remain isolation-homogeneous.
+            current_batch = ProducerBatch(tp, builder, now=now, isolation=batch.isolation)
             current_batch.created = batch.created
 
             for record in group:
@@ -285,7 +342,7 @@ class RecordAccumulator:
                         self.config['compression_attrs'],
                         self.config['batch_size'],
                     )
-                    current_batch = ProducerBatch(tp, builder, now=now)
+                    current_batch = ProducerBatch(tp, builder, now=now, isolation=batch.isolation)
                     current_batch.created = batch.created
                     metadata = builder.append(record.timestamp, record.key, record.value, record.headers)
 
@@ -494,6 +551,8 @@ class RecordAccumulator:
                     size += batch.records.size_in_bytes()
                     ready.append(batch)
                     batch.drained = now
+        if ready:
+            self._notify_batch_slot_freed()
         return ready
 
     def drain(self, cluster, nodes, max_size, now=None):
@@ -576,6 +635,7 @@ class RecordAccumulator:
         # batch appended by the last appending thread.
         self.abort_batches(error)
         self._batches.clear()
+        self._notify_batch_slot_freed()
 
     def abort_batches(self, error):
         """Abort every incomplete batch, including in-flight (drained but
@@ -595,6 +655,7 @@ class RecordAccumulator:
                     pass
             batch.abort(error)
             self.deallocate(batch)
+        self._notify_batch_slot_freed()
 
     def abort_undrained_batches(self, error):
         for batch in self._incomplete.all():
@@ -612,6 +673,7 @@ class RecordAccumulator:
             if aborted:
                 batch.abort(error)
                 self.deallocate(batch)
+        self._notify_batch_slot_freed()
 
     def close(self):
         """Close this accumulator and force all the record buffers to be drained."""
