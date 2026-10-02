@@ -896,7 +896,8 @@ class KafkaProducer:
         self._sender.wakeup()
         result.wait()
 
-    def send(self, topic, value=None, key=None, headers=None, partition=None, timestamp_ms=None):
+    def send(self, topic, value=None, key=None, headers=None, partition=None,
+             timestamp_ms=None, delivery_timeout_ms=None):
         """Publish a message to a topic.
 
         Arguments:
@@ -921,6 +922,18 @@ class KafkaProducer:
                 are tuples of str key and bytes value.
             timestamp_ms (int, optional): epoch milliseconds (from Jan 1 1970 UTC)
                 to use as the message timestamp. Defaults to current time.
+            delivery_timeout_ms (int, optional): per-record override of the
+                producer-level ``delivery_timeout_ms`` for this send only.
+                Gives a hard upper bound (in milliseconds) on how long this
+                record may wait to be acknowledged: if the record is still
+                unsent when its deadline passes, its future fails with
+                :class:`~kafka.errors.KafkaTimeoutError` (and it is dropped
+                out of its batch, leaving the other records sendable). A
+                record that is already in flight when the deadline passes is
+                *not* reported as failed; it remains bound by the
+                producer-level ``delivery_timeout_ms`` because the client
+                cannot know whether the broker committed it. Defaults to the
+                configured ``delivery_timeout_ms``.
 
         Returns:
             FutureRecordMetadata: resolves to RecordMetadata
@@ -938,6 +951,8 @@ class KafkaProducer:
         """
         if self._closed:
             raise Errors.IllegalStateError('KafkaProducer already closed!')
+        if delivery_timeout_ms is not None and delivery_timeout_ms < 0:
+            raise ValueError('delivery_timeout_ms must be >= 0')
         if value is None and self.config['api_version'] < (0, 8, 1):
             raise ValueError('Null messages require kafka >= 0.8.1')
         if value is None and key is None:
@@ -996,7 +1011,8 @@ class KafkaProducer:
         # the next one.
         sticky_eligible = not explicit_partition and key_bytes is None
         result = self._accumulator.append(tp, timestamp_ms, key_bytes, value_bytes, headers,
-                                          abort_on_new_batch=sticky_eligible)
+                                          abort_on_new_batch=sticky_eligible,
+                                          delivery_timeout_ms=delivery_timeout_ms)
         future, batch_is_full, new_batch_created, abort_for_new_batch = result
         if abort_for_new_batch:
             prev_partition = partition
@@ -1009,7 +1025,8 @@ class KafkaProducer:
             if self._transaction_manager and self._transaction_manager.is_transactional():
                 self._transaction_manager.maybe_add_partition_to_transaction(tp)
             result = self._accumulator.append(tp, timestamp_ms, key_bytes, value_bytes, headers,
-                                              abort_on_new_batch=False)
+                                              abort_on_new_batch=False,
+                                              delivery_timeout_ms=delivery_timeout_ms)
             future, batch_is_full, new_batch_created, _ = result
 
         if batch_is_full or new_batch_created:

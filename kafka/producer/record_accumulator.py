@@ -111,7 +111,7 @@ class RecordAccumulator:
         return self._tp_locks[tp]
 
     def append(self, tp, timestamp_ms, key, value, headers, now=None,
-               abort_on_new_batch=False):
+               abort_on_new_batch=False, delivery_timeout_ms=None):
         """Add a record to the accumulator, return the append result.
 
         The append result will contain the future metadata, and flag for
@@ -129,6 +129,12 @@ class RecordAccumulator:
                 batch when no in-progress batch has room. Caller is expected
                 to consult the partitioner's ``on_new_batch`` hook, re-pick
                 the partition, and retry with ``abort_on_new_batch=False``.
+            delivery_timeout_ms (int, optional): Per-record override for the
+                producer's global ``delivery_timeout_ms``. The record is
+                failed with a timeout if it is still unsent when this much
+                time has elapsed since the append. Once the containing batch
+                has been drained (is in flight), only the global timeout
+                applies.
 
         Returns:
             tuple: (future, batch_is_full, new_batch_created, abort_for_new_batch)
@@ -147,7 +153,8 @@ class RecordAccumulator:
                 dq = self._batches[tp]
                 if dq:
                     last = dq[-1]
-                    future = last.try_append(timestamp_ms, key, value, headers, now=now)
+                    future = last.try_append(timestamp_ms, key, value, headers, now=now,
+                                             delivery_timeout_ms=delivery_timeout_ms)
                     if future is not None:
                         batch_is_full = len(dq) > 1 or last.records.is_full()
                         return future, batch_is_full, False, False
@@ -165,7 +172,8 @@ class RecordAccumulator:
 
                 if dq:
                     last = dq[-1]
-                    future = last.try_append(timestamp_ms, key, value, headers, now=now)
+                    future = last.try_append(timestamp_ms, key, value, headers, now=now,
+                                             delivery_timeout_ms=delivery_timeout_ms)
                     if future is not None:
                         # Somebody else found us a batch, return the one we
                         # waited for! Hopefully this doesn't happen often...
@@ -183,7 +191,8 @@ class RecordAccumulator:
                 )
 
                 batch = ProducerBatch(tp, records, now=now)
-                future = batch.try_append(timestamp_ms, key, value, headers, now=now)
+                future = batch.try_append(timestamp_ms, key, value, headers, now=now,
+                                          delivery_timeout_ms=delivery_timeout_ms)
                 if not future:
                     raise Exception()
 
@@ -198,10 +207,23 @@ class RecordAccumulator:
         self._next_batch_expiry_time_ms = float('inf')
 
     def maybe_update_next_batch_expiry_time(self, batch):
-        self._next_batch_expiry_time_ms = min(self._next_batch_expiry_time_ms, batch.created * 1000 + self.delivery_timeout_ms)
+        self._next_batch_expiry_time_ms = min(
+            self._next_batch_expiry_time_ms,
+            batch.created * 1000 + self.delivery_timeout_ms,
+            batch.next_record_expiry_time_ms(self.delivery_timeout_ms))
 
     def expired_batches(self, now=None):
-        """Get a list of batches which have been sitting in the accumulator too long and need to be expired."""
+        """Return batches that need to be expired from the accumulator.
+
+        The returned batches are *fully* expired (global delivery timeout or a
+        batch that can no longer be partially split, e.g. one already stamped
+        with a producer sequence); the sender fails every record in them.
+
+        When only some records in an undrained, never-sent batch have passed
+        their per-send deadlines, those records are failed locally and the
+        surviving records are rebuilt into a fresh batch that stays at the
+        head of the partition's deque; such batches are not returned.
+        """
         expired_batches = []
         for tp in list(self._batches.keys()):
             with self._tp_lock(tp):
@@ -210,15 +232,85 @@ class RecordAccumulator:
                 dq = self._batches[tp]
                 while dq:
                     batch = dq[0]
-                    if batch.has_reached_delivery_timeout(self.delivery_timeout_ms, now=now):
+                    if batch.has_reached_delivery_timeout(self.delivery_timeout_ms, now=now) or (
+                            # A batch that was previously drained keeps its
+                            # assigned producer sequence. Per-record expiry
+                            # cannot split it without leaving a sequence gap
+                            # (idempotent producers), so fail it as a whole.
+                            (batch.in_retry() or batch.has_sequence)
+                            and batch.has_expired_record(self.delivery_timeout_ms, now=now)):
                         dq.popleft()
                         batch.records.close()
                         expired_batches.append(batch)
+                    elif batch.has_expired_record(self.delivery_timeout_ms, now=now):
+                        # First-attempt, undrained batch with a mix of expired
+                        # and live per-record deadlines: drop the dead records
+                        # and reenqueue a batch containing only the survivors.
+                        survivor = self._split_off_expired_records(batch, now=now)
+                        dq.popleft()
+                        self._incomplete.remove(batch)
+                        if survivor is not None and survivor.record_count:
+                            dq.appendleft(survivor)
+                            # Survivor holds only live records; later batches
+                            # are newer, so stop scanning this partition.
+                            self.maybe_update_next_batch_expiry_time(survivor)
+                            break
+                        # Every record was expired: continue with the next head.
                     else:
                         # Stop at the first batch that has not expired.
                         self.maybe_update_next_batch_expiry_time(batch)
                         break
         return expired_batches
+
+    def _split_off_expired_records(self, batch, now=None):
+        """Fail expired record futures and rebuild the survivors.
+
+        Returns a new ``ProducerBatch`` containing the still-live records, or
+        ``None`` if every record has expired. Only valid for a closed,
+        first-attempt batch that has never been drained (no producer sequence
+        assigned), which keeps idempotent sequence numbers gap-free.
+        """
+        now = time.monotonic() if now is None else now
+        tp = batch.topic_partition
+        batch.records.close()
+        expired_indices, live_indices = batch.split_by_record_expiry(
+            self.delivery_timeout_ms, now=now)
+
+        if expired_indices:
+            error_message = ("Expiring %d record(s) for %s: per-send delivery timeout passed"
+                             " before the batch could be sent" % (len(expired_indices), tp))
+            log.warning(error_message)
+            batch.fail_records(expired_indices, Errors.KafkaTimeoutError(error_message))
+
+        if not live_indices:
+            return None
+
+        records_list = []
+        for record_batch in MemoryRecords(batch.records.buffer()):
+            for record in record_batch:
+                records_list.append(record)
+
+        builder = MemoryRecordsBuilder(
+            self.config['message_version'],
+            self.config['compression_attrs'],
+            self.config['batch_size'],
+        )
+        survivor = ProducerBatch(tp, builder, now=batch.created)
+        # Preserve the original batch-creation anchor (global delivery
+        # timeout and retry accounting) and the records' absolute deadlines.
+        survivor.last_append = now
+        for new_index, original_index in enumerate(live_indices):
+            record = records_list[original_index]
+            metadata = builder.append(record.timestamp, record.key, record.value, record.headers)
+            original_future = batch._record_futures[original_index]
+            original_future.rebind(survivor.produce_future, metadata.offset)
+            survivor._record_futures.append(original_future)
+            survivor._record_deadlines.append(batch._record_deadlines[original_index])
+        builder.close()
+        self._incomplete.add(survivor)
+        log.info("Split %d expired record(s) out of batch for %s; %d record(s) remain sendable",
+                 len(expired_indices), tp, len(live_indices))
+        return survivor
 
     def split_and_reenqueue(self, batch, now=None):
         """Split an oversized batch into smaller batches and reenqueue them.
@@ -294,6 +386,10 @@ class RecordAccumulator:
                     original_future = batch._record_futures[future_index]
                     original_future.rebind(current_batch.produce_future, metadata.offset)
                     current_batch._record_futures.append(original_future)
+                    # The records were already in flight on the failed
+                    # attempt, so only the global delivery timeout applies
+                    # from here on (anchored at the preserved created time).
+                    current_batch._record_deadlines.append(None)
                 future_index += 1
 
             new_batches.append(current_batch)

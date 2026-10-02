@@ -28,6 +28,12 @@ class ProducerBatch:
         self.topic_partition = tp
         self.produce_future = FutureProduceResult(tp)
         self._record_futures = []
+        # Per-record delivery deadlines (monotonic seconds). Entry i aligns
+        # with record i in self.records / self._record_futures. Each entry is
+        # either an explicit deadline (append time + per-send delivery
+        # timeout) or None, meaning the record inherits the producer's global
+        # delivery_timeout_ms (deadline == created + global timeout).
+        self._record_deadlines = []
         self._retry = False
         self._final_state = None
 
@@ -56,7 +62,7 @@ class ProducerBatch:
         base_seq = self.base_sequence
         return base_seq is not None and base_seq != -1
 
-    def try_append(self, timestamp_ms, key, value, headers, now=None):
+    def try_append(self, timestamp_ms, key, value, headers, now=None, delivery_timeout_ms=None):
         metadata = self.records.append(timestamp_ms, key, value, headers)
         if metadata is None:
             return None
@@ -64,6 +70,9 @@ class ProducerBatch:
         now = time.monotonic() if now is None else now
         self.max_record_size = max(self.max_record_size, metadata.size)
         self.last_append = now
+        deadline = None
+        if delivery_timeout_ms is not None:
+            deadline = now + delivery_timeout_ms / 1000
         future = FutureRecordMetadata(
             self.produce_future,
             metadata.offset,
@@ -73,6 +82,7 @@ class ProducerBatch:
             len(value) if value is not None else -1,
             sum(len(h_key.encode("utf-8")) + len(h_val) for h_key, h_val in headers) if headers else -1)
         self._record_futures.append(future)
+        self._record_deadlines.append(deadline)
         return future
 
     def abort(self, exception):
@@ -168,6 +178,58 @@ class ProducerBatch:
     def has_reached_delivery_timeout(self, delivery_timeout_ms, now=None):
         now = time.monotonic() if now is None else now
         return delivery_timeout_ms / 1000 <= now - self.created
+
+    def record_deadline(self, index, default_delivery_timeout_ms):
+        """Absolute monotonic deadline for record ``index``.
+
+        Records appended without a per-send timeout inherit the producer's
+        global ``delivery_timeout_ms`` anchored at batch creation.
+        """
+        deadline = self._record_deadlines[index]
+        if deadline is not None:
+            return deadline
+        return self.created + default_delivery_timeout_ms / 1000
+
+    def next_record_expiry_time_ms(self, default_delivery_timeout_ms):
+        """Earliest per-record deadline in the batch, in monotonic ms.
+
+        Returns ``float('inf')`` if the batch holds no records.
+        """
+        if not self._record_deadlines:
+            return float('inf')
+        return min(self.record_deadline(i, default_delivery_timeout_ms)
+                   for i in range(len(self._record_deadlines))) * 1000
+
+    def has_expired_record(self, default_delivery_timeout_ms, now=None):
+        """True if any record in the batch has passed its own deadline."""
+        now = time.monotonic() if now is None else now
+        return any(self.record_deadline(i, default_delivery_timeout_ms) <= now
+                   for i in range(len(self._record_deadlines)))
+
+    def split_by_record_expiry(self, default_delivery_timeout_ms, now=None):
+        """Partition record indices into expired and live groups.
+
+        Returns ``(expired_indices, live_indices)`` with indices preserving
+        original record order. A record whose per-send deadline has passed is
+        expired; the rest are still sendable.
+        """
+        now = time.monotonic() if now is None else now
+        expired_indices = []
+        live_indices = []
+        for i in range(len(self._record_futures)):
+            if self.record_deadline(i, default_delivery_timeout_ms) <= now:
+                expired_indices.append(i)
+            else:
+                live_indices.append(i)
+        return expired_indices, live_indices
+
+    def fail_records(self, indices, exception):
+        """Fail the futures of specific records (used when dropping expired
+        records out of an unsent batch) without touching the batch's
+        ``produce_future``. Must be called before the batch is drained.
+        """
+        for index in indices:
+            self._record_futures[index].failure(exception)
 
     def in_retry(self):
         return self._retry
