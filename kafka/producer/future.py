@@ -43,12 +43,14 @@ class FutureRecordMetadata(Future):
     fails with the relevant exception (for example
     :class:`~kafka.errors.KafkaTimeoutError`).
     """
-    __slots__ = ('_produce_future', 'args')
-    def __init__(self, produce_future, batch_index, timestamp_ms, checksum, serialized_key_size, serialized_value_size, serialized_header_size):
+    __slots__ = ('_produce_future', 'args', 'delivery_deadline')
+    def __init__(self, produce_future, batch_index, timestamp_ms, checksum, serialized_key_size,
+                 serialized_value_size, serialized_header_size, delivery_deadline=None):
         super().__init__()
         self._produce_future = produce_future
         # packing args as a tuple is a minor speed optimization
         self.args = (batch_index, timestamp_ms, checksum, serialized_key_size, serialized_value_size, serialized_header_size)
+        self.delivery_deadline = delivery_deadline
         produce_future._add_cb_eb(self._produce_success, self.failure)
 
     def _produce_success(self, result):
@@ -84,17 +86,25 @@ class FutureRecordMetadata(Future):
         produce_future's latch will be woken and will re-wait on the new one.
         """
         old_produce_future = self._produce_future
+        old_produce_future.remove_callbacks(self._produce_success, self.failure)
         self._produce_future = new_produce_future
         _, timestamp_ms, checksum, sk, sv, sh = self.args
         self.args = (new_batch_index, timestamp_ms, checksum, sk, sv, sh)
         new_produce_future._add_cb_eb(self._produce_success, self.failure)
         # Wake any thread blocked in get() so it re-waits on the new future.
-        # The old produce_future is never completed, so its stale callbacks
-        # (registered in __init__) will never fire.
+        old_produce_future._latch.set()
+
+    def detach(self):
+        old_produce_future = self._produce_future
+        old_produce_future.remove_callbacks(self._produce_success, self.failure)
         old_produce_future._latch.set()
 
     def get(self, timeout=None):
         """Wait for up to timeout seconds for future to complete."""
+        if self.is_done:
+            if self.failed():
+                raise self.exception
+            return self.value
         # Loop because rebind() may wake us from the old produce_future's
         # latch before the record is actually done. A batch may be split
         # multiple times, so each rebind wakes us and we re-wait on the

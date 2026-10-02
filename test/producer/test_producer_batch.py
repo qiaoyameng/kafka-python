@@ -2,7 +2,7 @@
 
 import pytest
 
-from kafka.errors import IllegalStateError, KafkaError
+from kafka.errors import IllegalStateError, KafkaError, KafkaTimeoutError
 from kafka.producer.future import FutureRecordMetadata, RecordMetadata
 from kafka.producer.producer_batch import ProducerBatch
 from kafka.record.memory_records import MemoryRecordsBuilder
@@ -133,6 +133,20 @@ def test_complete_exceptionally_with_null_record_errors(batch):
 
     with pytest.raises(TypeError):
         _test_complete_exceptionally(batch, record_count, top_level_exception, None)
+
+
+def test_detached_record_ignores_late_batch_success():
+    tp = TopicPartition('foo', 0)
+    records = MemoryRecordsBuilder(magic=2, compression_type=0, batch_size=100000)
+    batch = ProducerBatch(tp, records)
+    future = batch.try_append(0, None, b'msg', [])
+
+    future.detach()
+    future.failure(KafkaTimeoutError('delivery status unknown'))
+    batch.complete(10, -1)
+
+    with pytest.raises(KafkaTimeoutError):
+        future.get(timeout=0)
 
 
 def test_producer_batch_lt(tp, memory_records_builder):

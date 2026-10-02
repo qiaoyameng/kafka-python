@@ -204,3 +204,15 @@ def test_idempotent_producer_reset_producer_id(cluster):
     assert transaction_manager.producer_id_and_epoch == test_producer_id_and_epoch
     transaction_manager.reset_producer_id()
     assert transaction_manager.producer_id_and_epoch == ProducerIdAndEpoch(-1, -1)
+
+
+def test_send_per_record_delivery_timeout_validation():
+    producer = KafkaProducer.__new__(KafkaProducer)
+    producer.config = {'delivery_timeout_ms': 60000}
+    producer._closed = False
+
+    with pytest.raises(ValueError):
+        producer.send('topic', value=b'a', delivery_timeout_ms=0)
+    with pytest.raises(KafkaConfigurationError):
+        producer.send('topic', value=b'a', delivery_timeout_ms=60001)
+    producer._closed = True

@@ -5,6 +5,7 @@ import pytest
 import kafka.errors as Errors
 from kafka.cluster import ClusterMetadata
 from kafka.producer.record_accumulator import RecordAccumulator
+from kafka.producer.transaction_manager import ProducerIdAndEpoch, TransactionManager
 from kafka.record.default_records import DefaultRecordBatchBuilder
 from kafka.structs import TopicPartition
 
@@ -254,3 +255,114 @@ def test_abort_on_new_batch_appends_to_existing(tp):
     assert future2 is not None
     assert new2 is False
     assert abort2 is False
+
+
+def test_prune_expired_records_keeps_unexpired_records(tp):
+    accum = RecordAccumulator(linger_ms=0, delivery_timeout_ms=60000)
+    short_future, *_ = accum.append(
+        tp, 0, b'k1', b'v1', [], now=0, delivery_deadline=0.002)
+    long_future, *_ = accum.append(
+        tp, 0, b'k2', b'v2', [], now=0, delivery_deadline=0.060)
+
+    expired, fully_expired_batches = accum.prune_expired_records(now=0.003)
+
+    assert len(expired) == 1
+    assert short_future.failed()
+    assert isinstance(short_future.exception, Errors.KafkaTimeoutError)
+    assert not long_future.is_done
+    assert not fully_expired_batches
+    dq = accum._batches[tp]
+    assert len(dq) == 1
+    assert dq[0].record_count == 1
+
+
+def test_prune_expired_records_assigns_contiguous_sequence_to_survivors(client, tp):
+    cluster = client.cluster
+    cluster._partitions[tp] = None
+    cluster._broker_partitions = {0: {tp}}
+    transaction_manager = TransactionManager(
+        transactional_id=None,
+        transaction_timeout_ms=60000,
+        retry_backoff_ms=100,
+        api_version=(4, 3),
+        metadata=cluster)
+    transaction_manager.set_producer_id_and_epoch(ProducerIdAndEpoch(1000, 0))
+    accum = RecordAccumulator(
+        linger_ms=0, delivery_timeout_ms=60000,
+        transaction_manager=transaction_manager)
+
+    short_future, *_ = accum.append(
+        tp, 0, b'k1', b'v1', [], now=0, delivery_deadline=0.002)
+    long_future, *_ = accum.append(
+        tp, 0, b'k2', b'v2', [], now=0, delivery_deadline=0.060)
+    accum.prune_expired_records(now=0.003)
+
+    batches = accum.drain_batches_for_one_node(cluster, 0, 1048576, now=0.004)
+
+    assert len(batches) == 1
+    assert batches[0].record_count == 1
+    assert batches[0].base_sequence == 0
+    assert transaction_manager.sequence_number(tp) == 1
+    assert short_future.failed()
+    assert not long_future.is_done
+
+
+def test_prune_expired_records_does_not_split_drained_or_retry_batch(tp, cluster):
+    accum = RecordAccumulator(linger_ms=0, delivery_timeout_ms=60000)
+    short_future, *_ = accum.append(
+        tp, 0, b'k1', b'v1', [], now=0, delivery_deadline=0.002)
+    long_future, *_ = accum.append(
+        tp, 0, b'k2', b'v2', [], now=0, delivery_deadline=0.060)
+    drained = accum.drain(cluster, {0}, 1048576, now=0.001)[0]
+    batch = drained[0]
+    accum.reenqueue(batch, now=0.002)
+
+    expired, fully_expired_batches = accum.prune_expired_records(now=0.003)
+
+    assert not expired
+    assert not fully_expired_batches
+    assert accum._batches[tp][0] is batch
+    assert batch.record_count == 2
+    assert not short_future.is_done
+    assert not long_future.is_done
+
+
+def test_transactional_unsent_partial_expiry_aborts_survivors(client):
+    from kafka.producer.sender import Sender
+
+    cluster = client.cluster
+    tp = TopicPartition('foo', 0)
+    cluster._partitions[tp] = None
+    cluster._broker_partitions = {0: {tp}}
+    tm = TransactionManager(
+        transactional_id='txn-id',
+        transaction_timeout_ms=60000,
+        retry_backoff_ms=0,
+        api_version=(4, 3),
+        metadata=cluster)
+    tm.set_producer_id_and_epoch(ProducerIdAndEpoch(1000, 0))
+    from kafka.producer.transaction_manager import TransactionState
+    tm._transition_to(TransactionState.INITIALIZING)
+    tm._transition_to(TransactionState.READY)
+    tm.begin_transaction()
+
+    accum = RecordAccumulator(
+        transaction_manager=tm, linger_ms=0, delivery_timeout_ms=60000,
+        request_timeout_ms=5000, retry_backoff_ms=0)
+    sender = Sender(client, cluster, accum,
+                    transaction_manager=tm, transactional_id='txn-id',
+                    acks=-1, request_timeout_ms=5000, retry_backoff_ms=0,
+                    guarantee_message_order=True)
+
+    short_future, *_ = accum.append(
+        tp, 0, None, b'short', [], now=0, delivery_deadline=0.002)
+    long_future, *_ = accum.append(
+        tp, 0, None, b'long', [], now=0, delivery_deadline=0.060)
+
+    sender._send_producer_data(now=0.003)
+
+    assert short_future.failed()
+    assert long_future.failed()
+    assert isinstance(long_future.exception, Errors.KafkaTimeoutError)
+    assert tm.has_abortable_error()
+    assert not accum.has_incomplete

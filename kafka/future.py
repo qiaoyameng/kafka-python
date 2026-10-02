@@ -163,6 +163,14 @@ class Future:
                     raise e
         return self
 
+    def remove_callbacks(self, cb, eb):
+        with self._lock:
+            if self.is_done:
+                return self
+            self._callbacks = [f for f in self._callbacks if f != cb]
+            self._errbacks = [f for f in self._errbacks if f != eb]
+        return self
+
     def add_both(self, f, *args, **kwargs):
         self.add_callback(f, *args, **kwargs)
         self.add_errback(f, *args, **kwargs)

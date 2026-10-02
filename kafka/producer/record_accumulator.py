@@ -111,7 +111,7 @@ class RecordAccumulator:
         return self._tp_locks[tp]
 
     def append(self, tp, timestamp_ms, key, value, headers, now=None,
-               abort_on_new_batch=False):
+               abort_on_new_batch=False, delivery_deadline=None):
         """Add a record to the accumulator, return the append result.
 
         The append result will contain the future metadata, and flag for
@@ -147,7 +147,9 @@ class RecordAccumulator:
                 dq = self._batches[tp]
                 if dq:
                     last = dq[-1]
-                    future = last.try_append(timestamp_ms, key, value, headers, now=now)
+                    future = last.try_append(timestamp_ms, key, value, headers,
+                                             now=now,
+                                             delivery_deadline=delivery_deadline)
                     if future is not None:
                         batch_is_full = len(dq) > 1 or last.records.is_full()
                         return future, batch_is_full, False, False
@@ -165,7 +167,9 @@ class RecordAccumulator:
 
                 if dq:
                     last = dq[-1]
-                    future = last.try_append(timestamp_ms, key, value, headers, now=now)
+                    future = last.try_append(timestamp_ms, key, value, headers,
+                                             now=now,
+                                             delivery_deadline=delivery_deadline)
                     if future is not None:
                         # Somebody else found us a batch, return the one we
                         # waited for! Hopefully this doesn't happen often...
@@ -183,7 +187,9 @@ class RecordAccumulator:
                 )
 
                 batch = ProducerBatch(tp, records, now=now)
-                future = batch.try_append(timestamp_ms, key, value, headers, now=now)
+                future = batch.try_append(timestamp_ms, key, value, headers,
+                                          now=now,
+                                          delivery_deadline=delivery_deadline)
                 if not future:
                     raise Exception()
 
@@ -198,7 +204,121 @@ class RecordAccumulator:
         self._next_batch_expiry_time_ms = float('inf')
 
     def maybe_update_next_batch_expiry_time(self, batch):
-        self._next_batch_expiry_time_ms = min(self._next_batch_expiry_time_ms, batch.created * 1000 + self.delivery_timeout_ms)
+        deadline = batch.earliest_delivery_deadline(self.delivery_timeout_ms)
+        if deadline is not None:
+            self._next_batch_expiry_time_ms = min(self._next_batch_expiry_time_ms, deadline * 1000)
+
+    def _timeout_error(self, batch, now):
+        elapsed_ms = max(0, int((now - batch.created) * 1000))
+        return Errors.KafkaTimeoutError(
+            "Expiring %d record(s) for %s: %s ms has passed since record creation"
+            % (batch.record_count, str(batch.topic_partition), elapsed_ms))
+
+    def _new_batch(self, tp, now=None, created=None):
+        builder = MemoryRecordsBuilder(
+            self.config['message_version'],
+            self.config['compression_attrs'],
+            self.config['batch_size'],
+        )
+        batch = ProducerBatch(tp, builder, now=now)
+        if created is not None:
+            batch.created = created
+        return batch, builder
+
+    def _rebuild_records(self, tp, records, futures, original_batch, now=None):
+        new_batches = []
+        current_batch = None
+        current_builder = None
+        for record, future in zip(records, futures):
+            if current_builder is None:
+                current_batch, current_builder = self._new_batch(
+                    tp, now=now, created=original_batch.created)
+                current_batch.attempts = original_batch.attempts
+                current_batch.last_attempt = original_batch.last_attempt
+            metadata = current_builder.append(
+                record.timestamp, record.key, record.value, record.headers)
+            if metadata is None:
+                current_batch.records.close()
+                new_batches.append(current_batch)
+                current_batch, current_builder = self._new_batch(
+                    tp, now=now, created=original_batch.created)
+                current_batch.attempts = original_batch.attempts
+                current_batch.last_attempt = original_batch.last_attempt
+                metadata = current_builder.append(
+                    record.timestamp, record.key, record.value, record.headers)
+            future.rebind(current_batch.produce_future, metadata.offset)
+            current_batch._record_futures.append(future)
+        if current_batch is not None:
+            new_batches.append(current_batch)
+        return new_batches
+
+    def prune_expired_records(self, now=None):
+        """Remove per-record deadlines from batches that have never been sent."""
+        now = time.monotonic() if now is None else now
+        expired = []
+        fully_expired_batches = []
+        for tp in list(self._batches.keys()):
+            with self._tp_lock(tp):
+                dq = self._batches[tp]
+                rebuilt = collections.deque()
+                while dq:
+                    batch = dq.popleft()
+                    can_partially_expire = batch.attempts == 0 and batch.drained is None
+                    if not can_partially_expire or not batch.has_expired_records(
+                            now, self.delivery_timeout_ms):
+                        rebuilt.append(batch)
+                        continue
+
+                    batch.records.close()
+                    expired_indices = set(batch.expired_record_indices(
+                        now, self.delivery_timeout_ms))
+                    records = []
+                    for record_batch in MemoryRecords(batch.records.buffer()):
+                        records.extend(record_batch)
+
+                    surviving_records = []
+                    surviving_futures = []
+                    errors = {}
+                    has_survivors = False
+                    for index, (record, future) in enumerate(
+                            zip(records, batch._record_futures)):
+                        if index in expired_indices:
+                            exception = self._timeout_error(batch, now)
+                            errors[index] = exception
+                        else:
+                            has_survivors = True
+                            surviving_records.append(record)
+                            surviving_futures.append(future)
+
+                    if has_survivors:
+                        for future in surviving_futures:
+                            future.detach()
+                        new_batches = self._rebuild_records(
+                            tp, surviving_records, surviving_futures, batch, now=now)
+                        rebuilt.extend(new_batches)
+                        for new_batch in new_batches:
+                            self._incomplete.add(new_batch)
+                        for index in expired_indices:
+                            expired.append((
+                                batch._record_futures[index],
+                                errors[index]))
+                    else:
+                        exception = next(iter(errors.values())) if errors else self._timeout_error(batch, now)
+                        fully_expired_batches.append((
+                            batch,
+                            exception,
+                            lambda index, errors=errors, default=exception: errors.get(index, default),
+                        ))
+
+                    self._incomplete.remove(batch)
+                self._batches[tp] = rebuilt
+
+        for batch, exception, record_exceptions_fn in fully_expired_batches:
+            batch.complete_exceptionally(exception, record_exceptions_fn)
+        for future, exception in expired:
+            future.detach()
+            future.failure(exception)
+        return expired, fully_expired_batches
 
     def expired_batches(self, now=None):
         """Get a list of batches which have been sitting in the accumulator too long and need to be expired."""
@@ -220,25 +340,8 @@ class RecordAccumulator:
                         break
         return expired_batches
 
-    def split_and_reenqueue(self, batch, now=None):
-        """Split an oversized batch into smaller batches and reenqueue them.
-
-        When a produce request fails with MESSAGE_TOO_LARGE, this method splits
-        the batch into two sub-batches (by record count) and enqueues them at
-        the front of the partition's deque. The original FutureRecordMetadata
-        objects are rebound to the new batches' futures.
-
-        If the new batches are still too large, they will be split again on the
-        next MESSAGE_TOO_LARGE response.
-
-        Only supported for message_version >= 2 (DefaultRecordBatch).
-
-        Arguments:
-            batch (ProducerBatch): The oversized batch to split.
-
-        Returns:
-            int: The number of new batches created.
-        """
+    def _rebuild_unexpired_records_for_retry(self, batch, now=None, split=False):
+        """Rebuild an explicitly rejected batch using still-valid records."""
         now = time.monotonic() if now is None else now
         tp = batch.topic_partition
 
@@ -251,65 +354,66 @@ class RecordAccumulator:
             if base_sequence is not None and base_sequence != -1:
                 self._transaction_manager.set_sequence_number(tp, base_sequence)
 
-        # Read all records from the closed batch
         records_list = []
         for record_batch in MemoryRecords(batch.records.buffer()):
-            for record in record_batch:
-                records_list.append(record)
+            records_list.extend(record_batch)
 
-        # Split records into two halves by count
-        mid = (len(records_list) + 1) // 2
-        groups = [records_list[:mid], records_list[mid:]]
+        future_count = min(len(records_list), len(batch._record_futures))
+        surviving_records = []
+        surviving_futures = []
+        expired_futures = []
+        for index in range(future_count):
+            future = batch._record_futures[index]
+            deadline = future.delivery_deadline
+            if deadline is None:
+                deadline = batch.created + self.delivery_timeout_ms / 1000
+            if deadline <= now:
+                expired_futures.append((
+                    future,
+                    Errors.KafkaTimeoutError(
+                        "Expiring 1 record for %s: delivery deadline passed" % str(tp))))
+            else:
+                surviving_records.append(records_list[index])
+                surviving_futures.append(future)
 
+        if not surviving_records:
+            for future, exception in expired_futures:
+                future.detach()
+                future.failure(exception)
+            return 0
+
+        if split:
+            mid = (len(surviving_records) + 1) // 2
+            groups = [
+                (surviving_records[:mid], surviving_futures[:mid]),
+                (surviving_records[mid:], surviving_futures[mid:]),
+            ]
+        else:
+            groups = [(surviving_records, surviving_futures)]
         new_batches = []
-        future_index = 0
-        for group in groups:
-            if not group:
+        for records, futures in groups:
+            if not records:
                 continue
-            builder = MemoryRecordsBuilder(
-                self.config['message_version'],
-                self.config['compression_attrs'],
-                self.config['batch_size'],
-            )
-            current_batch = ProducerBatch(tp, builder, now=now)
-            current_batch.created = batch.created
-
-            for record in group:
-                metadata = builder.append(record.timestamp, record.key, record.value, record.headers)
-                if metadata is None:
-                    # Record doesn't fit (extremely unlikely for split batches).
-                    # Finalize this batch and start a new one.
-                    new_batches.append(current_batch)
-                    builder = MemoryRecordsBuilder(
-                        self.config['message_version'],
-                        self.config['compression_attrs'],
-                        self.config['batch_size'],
-                    )
-                    current_batch = ProducerBatch(tp, builder, now=now)
-                    current_batch.created = batch.created
-                    metadata = builder.append(record.timestamp, record.key, record.value, record.headers)
-
-                # Rebind original future to new batch
-                if future_index < len(batch._record_futures):
-                    original_future = batch._record_futures[future_index]
-                    original_future.rebind(current_batch.produce_future, metadata.offset)
-                    current_batch._record_futures.append(original_future)
-                future_index += 1
-
-            new_batches.append(current_batch)
+            rebuilt = self._rebuild_records(tp, records, futures, batch, now=now)
+            new_batches.extend(rebuilt)
 
         # Enqueue in reverse order so first batch is at front of deque
         with self._tp_lock(tp):
             dq = self._batches[tp]
             for new_batch in reversed(new_batches):
-                new_batch.attempts = batch.attempts
                 new_batch.last_attempt = now
                 dq.appendleft(new_batch)
                 self._incomplete.add(new_batch)
 
-        log.info("Split oversized batch for %s into %d new batches (%d total records)",
-                 tp, len(new_batches), future_index)
+        for future, exception in expired_futures:
+            future.failure(exception)
+
+        log.info("Rebuilt %d surviving record(s) for %s into %d batch(es)",
+                 len(surviving_records), tp, len(new_batches))
         return len(new_batches)
+
+    def split_and_reenqueue(self, batch, now=None):
+        return self._rebuild_unexpired_records_for_retry(batch, now=now, split=True)
 
     def reenqueue(self, batch, now=None):
         """

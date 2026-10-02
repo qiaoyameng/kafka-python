@@ -8,6 +8,7 @@ from kafka import errors as Errors
 from kafka.metrics.measurable import AnonMeasurable
 from kafka.metrics.stats import Avg, Max, Rate
 from kafka.net.wakeup_notifier import WakeupNotifier
+from kafka.producer.producer_batch import ProducerBatch
 from kafka.producer.transaction_manager import TransactionManager
 from kafka.protocol.producer import ProduceRequest, ProduceResponse
 from kafka.structs import TopicPartition
@@ -88,28 +89,47 @@ class Sender:
         queue.pop()
         heapq.heapify(queue)
 
-    def _get_expired_inflight_batches(self, now=None):
-        """Get the in-flight batches that has reached delivery timeout."""
-        expired_batches = []
-        to_remove = []
-        for tp, queue in self._in_flight_batches.items():
-            while queue:
-                _created_at, batch = queue[0]
-                if batch.has_reached_delivery_timeout(self._accumulator.delivery_timeout_ms):
-                    heapq.heappop(queue)
-                    if batch.final_state is None:
-                        expired_batches.append(batch)
-                    else:
-                        raise Errors.IllegalStateError("%s batch created at %s gets unexpected final state %s" % (batch.topic_partition, batch.created, batch.final_state))
+    def _expire_inflight_record_deadlines(self, now=None):
+        """Expire individual records while leaving their request in flight.
+
+        A local delivery timeout cannot prove that the broker rejected or did
+        not append the records. Expired futures therefore resolve with an
+        ambiguous KafkaTimeoutError, while the original produce request stays
+        outstanding. Still-pending futures in the same batch continue to wait
+        for the broker response.
+        """
+        fully_expired_batches = []
+        for tp, queue in list(self._in_flight_batches.items()):
+            for _created_at, batch in list(queue):
+                expired_indices = batch.expired_record_indices(
+                    now, self._accumulator.delivery_timeout_ms)
+                if not expired_indices:
+                    self._accumulator.maybe_update_next_batch_expiry_time(batch)
+                    continue
+
+                exception = Errors.KafkaTimeoutError(
+                    "Expiring %d record(s) for %s after delivery timeout while the produce"
+                    " request is in flight; broker delivery status is unknown."
+                    % (len(expired_indices), str(batch.topic_partition)))
+                batch.detach_expired_records(expired_indices, exception)
+
+                if self._transaction_manager and self._transaction_manager.is_transactional():
+                    self._transaction_manager.transition_to_abortable_error(exception)
+
+                if batch.active_record_count == 0:
+                    exception = Errors.KafkaTimeoutError(
+                        "Expiring batch for %s after delivery timeout while the produce"
+                        " request is in flight; broker delivery status is unknown."
+                        % str(batch.topic_partition))
+                    batch.complete_exceptionally(exception, lambda _: exception)
+                    self._maybe_remove_from_inflight_batches(batch)
+                    self._accumulator.deallocate(batch)
+                    if self._transaction_manager and not self._transaction_manager.is_transactional():
+                        self._transaction_manager.reset_producer_id()
+                    fully_expired_batches.append(batch)
                 else:
                     self._accumulator.maybe_update_next_batch_expiry_time(batch)
-                    break
-            else:
-                # Avoid mutating in_flight_batches during iteration
-                to_remove.append(tp)
-        for tp in to_remove:
-            del self._in_flight_batches[tp]
-        return expired_batches
+        return fully_expired_batches
 
     def start(self):
         """Schedule the sender coroutine on the IO thread. Idempotent.
@@ -213,6 +233,15 @@ class Sender:
 
     def _send_producer_data(self, now=None):
         now = time.monotonic() if now is None else now
+        expired_record_futures, _fully_expired_batches = self._accumulator.prune_expired_records(now=now)
+        if (expired_record_futures and self._transaction_manager
+                and self._transaction_manager.is_transactional()):
+            exception = Errors.KafkaTimeoutError(
+                "At least one record expired before it was sent; transaction cannot commit.")
+            self._transaction_manager.transition_to_abortable_error(exception)
+            self._accumulator.abort_undrained_batches(exception)
+            expired_record_futures = []
+
         # get the list of partitions with data ready to send
         result = self._accumulator.ready(self._metadata, now=now)
         ready_nodes, next_ready_check_delay, unknown_leaders_exist = result
@@ -251,18 +280,29 @@ class Sender:
 
         self._accumulator.reset_next_batch_expiry_time()
         expired_batches = self._accumulator.expired_batches(now=now)
-        expired_batches.extend(self._get_expired_inflight_batches(now=now))
+        fully_expired_inflight_batches = set(
+            id(batch) for batch in self._expire_inflight_record_deadlines(now=now))
+        expired_batches = [
+            batch for batch in expired_batches
+            if id(batch) not in fully_expired_inflight_batches
+        ]
 
         if expired_batches:
             log.debug("%s: Expired %s batches in accumulator", str(self), len(expired_batches))
 
-        # Reset the producer_id if an expired batch has previously been sent to the broker.
-        # See the documentation of `TransactionState.reset_producer_id` to understand why
-        # we need to reset the producer id here.
-        if self._transaction_manager and any([batch.in_retry() for batch in expired_batches]):
-            needs_transaction_state_reset = True
-        else:
-            needs_transaction_state_reset = False
+        expired_ambiguous_batches = [
+            batch for batch in expired_batches
+            if batch.drained is not None]
+        needs_transaction_state_reset = (
+            self._transaction_manager is not None
+            and not self._transaction_manager.is_transactional()
+            and bool(expired_ambiguous_batches))
+
+        if self._transaction_manager and self._transaction_manager.is_transactional() and expired_ambiguous_batches:
+            self._transaction_manager.transition_to_abortable_error(
+                Errors.KafkaTimeoutError(
+                    "Expired in-flight batch for %s; broker delivery status is unknown."
+                    % str(expired_ambiguous_batches[0].topic_partition)))
 
         for expired_batch in expired_batches:
             error_message = "Expiring %d record(s) for %s: %s ms has passed since batch creation" % (
@@ -416,7 +456,20 @@ class Sender:
     def _failed_produce(self, batches, node_id, error):
         log.error("%s: Error sending produce request to node %d: %s", str(self), node_id, error) # trace
         for batch in batches:
-            self._complete_batch_with_exception(batch, error)
+            now = time.monotonic()
+            timed_out = (
+                isinstance(batch, ProducerBatch)
+                and batch.has_reached_delivery_timeout(
+                    self._accumulator.delivery_timeout_ms, now=now))
+            if timed_out and self._transaction_manager:
+                if self._transaction_manager.is_transactional():
+                    self._transaction_manager.transition_to_abortable_error(error)
+                else:
+                    self._transaction_manager.reset_producer_id()
+            if timed_out:
+                self._complete_batch_with_exception(batch, error, now=now)
+            else:
+                self._complete_batch_with_exception(batch, error)
         # Completing batches frees in-flight capacity, unmutes partitions, and
         # may re-enqueue retries; wake the loop to re-drain promptly.
         self.wakeup()
@@ -459,7 +512,7 @@ class Sender:
             return exc(err_msg)
         return record_exceptions_fn
 
-    def _complete_batch(self, batch, partition_response):
+    def _complete_batch(self, batch, partition_response, now=None):
         """Complete or retry the given batch of records based on a broker response.
 
         Handles both the success path (including treating
@@ -474,6 +527,12 @@ class Sender:
                 for the acks=0 case).
         """
         error_code = partition_response.error_code
+        if batch.final_state is not None:
+            self._maybe_remove_from_inflight_batches(batch)
+            self._accumulator.deallocate(batch)
+            if self.config['guarantee_message_order']:
+                self._accumulator.muted.discard(batch.topic_partition)
+            return
         if error_code != 0:
             error_cls = Errors.for_code(error_code)
             if error_cls is Errors.DuplicateSequenceNumberError:
@@ -508,9 +567,9 @@ class Sender:
             exception = Errors.ClusterAuthorizationFailedError("The producer is not authorized to do idempotent sends")
         else:
             exception = error_cls(partition_response.error_message)
-        self._dispatch_error(batch, exception, partition_response)
+        self._dispatch_error(batch, exception, partition_response, now=now)
 
-    def _complete_batch_with_exception(self, batch, exception):
+    def _complete_batch_with_exception(self, batch, exception, now=None):
         """Complete a batch following a client-side failure.
 
         Called from _failed_produce for network errors and from
@@ -525,9 +584,9 @@ class Sender:
         """
         if isinstance(exception, type):
             exception = exception(None)
-        self._dispatch_error(batch, exception, partition_response=None)
+        self._dispatch_error(batch, exception, partition_response=None, now=now)
 
-    def _dispatch_error(self, batch, exception, partition_response):
+    def _dispatch_error(self, batch, exception, partition_response, now=None):
         """Apply the appropriate outcome for a failed batch.
 
         Single decision point for both broker-reported errors (with a
@@ -539,13 +598,37 @@ class Sender:
         error_cls = type(exception)
         log_start_offset = partition_response.log_start_offset if partition_response is not None else -1
 
-        if self._can_split(batch, error_cls):
+        if batch.final_state is not None:
+            self._maybe_remove_from_inflight_batches(batch)
+            self._accumulator.deallocate(batch)
+            if self.config['guarantee_message_order']:
+                self._accumulator.muted.discard(batch.topic_partition)
+            return
+
+        if self._can_split(batch, error_cls, now=now):
+            expired_indices = batch.expired_record_indices(
+                now, self._accumulator.delivery_timeout_ms)
             log.warning("%s: Got %s on topic-partition %s with %d records, splitting batch and retrying",
                         str(self), error_cls.__name__, batch.topic_partition, batch.record_count)
-            self._accumulator.split_and_reenqueue(batch)
+            num_split = self._accumulator.split_and_reenqueue(batch, now=now)
             self._maybe_remove_from_inflight_batches(batch)
             self._accumulator.deallocate(batch)
             self._record_retries(batch)
+            if num_split == 0:
+                exception = Errors.KafkaTimeoutError(
+                    "All records in %s expired while splitting a failed produce request."
+                    % str(batch.topic_partition))
+                batch.done(top_level_exception=exception, record_exceptions_fn=lambda _: exception)
+                if self.config['guarantee_message_order']:
+                    self._accumulator.muted.discard(batch.topic_partition)
+                return
+            if (expired_indices
+                    and self._transaction_manager
+                    and self._transaction_manager.is_transactional()):
+                self._transaction_manager.transition_to_abortable_error(
+                    Errors.KafkaTimeoutError(
+                        "Expired record(s) in transactional batch %s; delivery status is unknown."
+                        % str(batch.topic_partition)))
         elif self._is_retention_based_unknown_producer_id(batch, error_cls, log_start_offset):
             # KAFKA-5793: the broker's producer state aged out due to
             # retention (log_start_offset > last_acked_offset), not
@@ -558,7 +641,17 @@ class Sender:
             self._accumulator.reenqueue(batch)
             self._maybe_remove_from_inflight_batches(batch)
             self._record_retries(batch)
-        elif self._can_retry(batch, error_cls):
+        elif self._can_retry(batch, error_cls, now=now):
+            now = time.monotonic() if now is None else now
+            expired_indices = batch.expired_record_indices(
+                now, self._accumulator.delivery_timeout_ms)
+            if expired_indices:
+                timeout_exception = Errors.KafkaTimeoutError(
+                    "At least one record expired before retrying batch %s; delivery status is unknown."
+                    % str(batch.topic_partition))
+                batch.detach_expired_records(expired_indices, timeout_exception)
+                if self._transaction_manager and self._transaction_manager.is_transactional():
+                    self._transaction_manager.transition_to_abortable_error(timeout_exception)
             error_message = exception.args[0] if exception.args and exception.args[0] is not None else None
             log.warning("%s: Got error produce response on topic-partition %s, retrying (%s attempts left): %s%s",
                         str(self), batch.topic_partition,
@@ -575,6 +668,15 @@ class Sender:
             # FAIL: dispatch transaction state transition via the
             # classifier (KIP-360), then finalize the batch.
             if self._transaction_manager:
+                timed_out_in_flight = (
+                    batch.drained is not None
+                    and batch.has_reached_delivery_timeout(self._accumulator.delivery_timeout_ms)
+                    and isinstance(exception, Errors.RetriableError))
+                if timed_out_in_flight:
+                    if self._transaction_manager.is_transactional():
+                        self._transaction_manager.transition_to_abortable_error(exception)
+                    else:
+                        self._transaction_manager.reset_producer_id()
                 classification = self._transaction_manager.classify_batch_error(
                     exception, batch, log_start_offset=log_start_offset)
 
@@ -625,13 +727,13 @@ class Sender:
         if issubclass(error_cls, Errors.InvalidMetadataError):
             self._metadata.request_update()
         if self.config['guarantee_message_order']:
-            self._accumulator.muted.remove(batch.topic_partition)
+            self._accumulator.muted.discard(batch.topic_partition)
 
     def _record_retries(self, batch):
         if self._sensors:
             self._sensors.record_retries(batch.topic_partition.topic, batch.record_count)
 
-    def _can_retry(self, batch, error_cls):
+    def _can_retry(self, batch, error_cls, now=None):
         """
         We can retry a send if the error is transient, the number of
         attempts taken is fewer than the maximum allowed, and - for the
@@ -639,7 +741,8 @@ class Sender:
         ours. A mismatched producer id/epoch (e.g. after a reset or future
         KIP-360 epoch bump) means retrying would violate idempotence.
         """
-        if batch.has_reached_delivery_timeout(self._accumulator.delivery_timeout_ms):
+        now = time.monotonic() if now is None else now
+        if batch.unexpired_record_count(now, self._accumulator.delivery_timeout_ms) == 0:
             return False
         if batch.attempts >= self.config['retries']:
             return False
@@ -681,16 +784,16 @@ class Sender:
         last_acked = self._transaction_manager.last_acked_offset(batch.topic_partition)
         return log_start_offset > last_acked
 
-    def _can_split(self, batch, error):
+    def _can_split(self, batch, error, now=None):
         """
         We can split and retry a batch if the error indicates the batch is too
-        large for the broker, the batch contains more than one record (so it
-        can actually be split), and the delivery timeout has not been reached.
+        large for the broker, and at least one record in it can survive.
         """
+        now = time.monotonic() if now is None else now
         return (error in (Errors.MessageSizeTooLargeError, Errors.RecordListTooLargeError) and
                 batch.record_count > 1 and
-                batch.final_state is None and
-                not batch.has_reached_delivery_timeout(self._accumulator.delivery_timeout_ms))
+                batch.unexpired_record_count(now, self._accumulator.delivery_timeout_ms) > 0 and
+                batch.final_state is None)
 
     def _create_produce_requests(self, collated):
         """

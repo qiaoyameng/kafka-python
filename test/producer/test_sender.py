@@ -1,6 +1,7 @@
 # pylint: skip-file
 
 import collections
+import heapq
 import io
 import math
 import threading
@@ -1472,6 +1473,237 @@ class TestKip360SenderIntegration:
         assert wakeup.calls == [sender.config['retry_backoff_ms'] / 1000]
 
 
+def test_split_drops_expired_records_and_preserves_sequence_range(client, transaction_manager):
+    cluster = client.cluster
+    tp = TopicPartition('foo', 0)
+    cluster._partitions[tp] = None
+    cluster._broker_partitions = {0: {tp}}
+    transaction_manager.set_producer_id_and_epoch(ProducerIdAndEpoch(1000, 0))
+    accumulator = RecordAccumulator(
+        batch_size=100000, transaction_manager=transaction_manager,
+        delivery_timeout_ms=60000, retry_backoff_ms=0)
+    sender = Sender(client, cluster, accumulator,
+                    transaction_manager=transaction_manager,
+                    guarantee_message_order=True)
+
+    records = MemoryRecordsBuilder(2, 0, 100000)
+    batch = ProducerBatch(tp, records, now=0)
+    futures = []
+    for i in range(5):
+        deadline = 0.002 if i < 2 else 0.060
+        futures.append(batch.try_append(
+            0, b'k-%d' % i, b'v-%d' % i, [], now=0,
+            delivery_deadline=deadline))
+    batch.records.set_producer_state(1000, 0, 0, False)
+    transaction_manager.sequence_number(tp)
+    transaction_manager.increment_sequence_number(tp, 5)
+    batch.records.close()
+    batch.drained = 0.001
+    batch.retry(now=0.001)
+    accumulator._incomplete.add(batch)
+
+    sender._complete_batch(
+        batch,
+        _partition_response(error_cls=Errors.MessageSizeTooLargeError),
+        now=0.003)
+
+    for future in futures[:2]:
+        assert future.failed()
+        assert isinstance(future.exception, Errors.KafkaTimeoutError)
+    for future in futures[2:]:
+        assert not future.is_done
+    assert transaction_manager.sequence_number(tp) == 0
+
+    first_rebuilt = accumulator.drain_batches_for_one_node(cluster, 0, 1048576, now=0.003)
+    assert len(first_rebuilt) == 1
+    assert first_rebuilt[0].base_sequence == 0
+    assert first_rebuilt[0].record_count == 2
+
+    accumulator.muted.discard(tp)
+    second_rebuilt = accumulator.drain_batches_for_one_node(cluster, 0, 1048576, now=0.003)
+    assert len(second_rebuilt) == 1
+    assert second_rebuilt[0].base_sequence == 2
+    assert second_rebuilt[0].record_count == 1
+    assert transaction_manager.sequence_number(tp) == 3
+
+def test_inflight_delivery_timeout_can_partially_fail_without_cancelling_request(sender, accumulator):
+    tp = TopicPartition('foo', 0)
+    records = MemoryRecordsBuilder(2, 0, 100000)
+    batch = ProducerBatch(tp, records, now=0)
+    short_future = batch.try_append(
+        0, None, b'short', [], now=0, delivery_deadline=0.002)
+    long_future = batch.try_append(
+        0, None, b'long', [], now=0, delivery_deadline=0.060)
+    batch.records.close()
+    batch.drained = 0.001
+    accumulator._incomplete.add(batch)
+    heapq.heappush(sender._in_flight_batches[tp], (batch.created, batch))
+
+    fully_expired = sender._expire_inflight_record_deadlines(now=0.003)
+
+    assert fully_expired == []
+    assert short_future.failed()
+    assert isinstance(short_future.exception, Errors.KafkaTimeoutError)
+    assert not long_future.is_done
+    assert any(item[1] is batch for item in sender._in_flight_batches[tp])
+    assert accumulator.has_incomplete
+
+    # Broker ack can still arrive, but it cannot turn the ambiguous local
+    # timeout into a success and must not double-resolve the record future.
+    assert batch.complete(10, -1)
+    assert short_future.failed()
+    assert isinstance(short_future.exception, Errors.KafkaTimeoutError)
+    assert long_future.succeeded()
+    assert long_future.value.offset == 11
+
+
+def test_inflight_delivery_timeout_transactional_becomes_abortable(client, cluster, mocker):
+    tm = TransactionManager(
+        transactional_id='txn-id',
+        transaction_timeout_ms=60000,
+        retry_backoff_ms=100,
+        api_version=(4, 3),
+        metadata=cluster)
+    tm.set_producer_id_and_epoch(ProducerIdAndEpoch(1000, 0))
+    from kafka.producer.transaction_manager import TransactionState
+    tm._transition_to(TransactionState.INITIALIZING)
+    tm._transition_to(TransactionState.READY)
+    tm.begin_transaction()
+    accumulator = RecordAccumulator(
+        transaction_manager=tm, delivery_timeout_ms=2,
+        linger_ms=0, request_timeout_ms=1)
+    sender = Sender(client, cluster, accumulator, transaction_manager=tm,
+                    transactional_id='txn-id')
+    mocker.spy(tm, 'transition_to_abortable_error')
+
+    tp = TopicPartition('foo', 0)
+    records = MemoryRecordsBuilder(2, 0, 100000)
+    batch = ProducerBatch(tp, records, now=0)
+    batch.try_append(0, None, b'msg', [])
+    batch.records.set_producer_state(1000, 0, 0, True)
+    batch.drained = 0.001
+    batch.retry(now=0.001)
+    accumulator._incomplete.add(batch)
+
+    heapq.heappush(sender._in_flight_batches[tp], (batch.created, batch))
+    fully_expired = sender._expire_inflight_record_deadlines(now=0.003)
+
+    assert fully_expired == [batch]
+    tm.transition_to_abortable_error.assert_called_once()
+    assert tm.has_abortable_error()
+
+
+def test_retriable_response_keeps_physical_batch_when_some_records_expired(client, transaction_manager):
+    cluster = client.cluster
+    tp = TopicPartition('foo', 0)
+    cluster._partitions[tp] = None
+    cluster._broker_partitions = {0: {tp}}
+    transaction_manager.set_producer_id_and_epoch(ProducerIdAndEpoch(1000, 0))
+    accumulator = RecordAccumulator(
+        transaction_manager=transaction_manager, delivery_timeout_ms=60000,
+        retry_backoff_ms=0)
+    sender = Sender(client, cluster, accumulator,
+                    transaction_manager=transaction_manager,
+                    guarantee_message_order=True)
+
+    batch = ProducerBatch(tp, MemoryRecordsBuilder(2, 0, 100000), now=0)
+    futures = []
+    for i in range(2):
+        deadline = 0.002 if i == 0 else 0.060
+        futures.append(batch.try_append(
+            0, None, b'v-%d' % i, [], now=0, delivery_deadline=deadline))
+    batch.records.set_producer_state(1000, 0, 0, False)
+    transaction_manager.sequence_number(tp)
+    transaction_manager.increment_sequence_number(tp, 2)
+    batch.records.close()
+    batch.drained = 0.001
+    batch.retry(now=0.001)
+    accumulator._incomplete.add(batch)
+    accumulator.muted.add(tp)
+
+    sender._complete_batch(
+        batch,
+        _partition_response(error_cls=Errors.NotLeaderForPartitionError),
+        now=0.003)
+
+    assert futures[0].failed()
+    assert isinstance(futures[0].exception, Errors.KafkaTimeoutError)
+    assert not futures[1].is_done
+    assert accumulator._batches[tp][0] is batch
+    assert batch.records.base_sequence == 0
+    assert transaction_manager.sequence_number(tp) == 2
+
+
+def test_mock_broker_held_ack_partial_delivery_deadline(broker, manager, net, client):
+    topic = 'deadline-topic'
+    tp = TopicPartition(topic, 0)
+    manager.bootstrap(timeout_ms=5000)
+
+    def metadata_topic(version=8):
+        Topic = MetadataResponse.MetadataResponseTopic
+        Partition = Topic.MetadataResponsePartition
+        return Topic(version=version, error_code=0, name=topic, is_internal=False,
+                     partitions=[
+                         Partition(version=version, error_code=0, partition_index=0,
+                                   leader_id=0, leader_epoch=0,
+                                   replica_nodes=[0], isr_nodes=[0], offline_replicas=[]),
+                     ])
+    broker.set_metadata(topics=[metadata_topic()])
+    net.run(client.cluster.refresh_metadata(), timeout_ms=5000)
+
+    held_calls = []
+    def on_produce(api_key, api_version, correlation_id, request_bytes):
+        request = ProduceRequest.decode(request_bytes, version=api_version, header=True)
+        held_calls.append(request)
+        async def delayed_response():
+            await net.sleep(0.2)
+            return ProduceResponse(
+                throttle_time_ms=0,
+                responses=[ProduceResponse.TopicProduceResponse(
+                    name=topic,
+                    partition_responses=[ProduceResponse.TopicProduceResponse.PartitionProduceResponse(
+                        index=0, error_code=0, base_offset=100,
+                        log_append_time_ms=-1, log_start_offset=0,
+                        record_errors=[], error_message=None,
+                        current_leader=None)])])
+        return delayed_response()
+
+    broker.respond_fn(ProduceRequest, on_produce)
+
+    accumulator = RecordAccumulator(
+        linger_ms=0, delivery_timeout_ms=60000, request_timeout_ms=5000,
+        retry_backoff_ms=0)
+    sender = Sender(client, client.cluster, accumulator,
+                    acks=1, request_timeout_ms=5000, retry_backoff_ms=0)
+
+    now = time.monotonic()
+    short_future, *_ = accumulator.append(
+        tp, 0, None, b'short', [], now=now,
+        delivery_deadline=now + 0.05)
+    long_future, *_ = accumulator.append(
+        tp, 0, None, b'long', [], now=now,
+        delivery_deadline=now + 1.0)
+
+    sender._send_producer_data(now=now)
+    net.poll(timeout_ms=0)
+    assert len(held_calls) == 1
+
+    deadline = time.monotonic() + 0.1
+    while not short_future.is_done and time.monotonic() < deadline:
+        sender._send_producer_data(now=time.monotonic())
+        net.poll(timeout_ms=5)
+    assert short_future.failed()
+    assert isinstance(short_future.exception, Errors.KafkaTimeoutError)
+    assert not long_future.is_done
+
+    deadline = time.monotonic() + 0.3
+    while not long_future.is_done and time.monotonic() < deadline:
+        sender._send_producer_data(now=time.monotonic())
+        net.poll(timeout_ms=10)
+    assert long_future.succeeded()
+    assert len(held_calls) == 1
+
+
 class TestProducerAcks:
     """End-to-end producer acks coverage through MockBroker.
 
@@ -1547,6 +1779,7 @@ class TestProducerAcks:
             assert future.succeeded()
             assert metadata.topic == self._TOPIC
             assert metadata.partition == 0
+
             assert metadata.offset == self._BASE_OFFSET
         finally:
             producer.close(timeout=2)

@@ -4,6 +4,7 @@ import logging
 import selectors
 import socket
 import threading
+import time
 import warnings
 import weakref
 
@@ -896,7 +897,8 @@ class KafkaProducer:
         self._sender.wakeup()
         result.wait()
 
-    def send(self, topic, value=None, key=None, headers=None, partition=None, timestamp_ms=None):
+    def send(self, topic, value=None, key=None, headers=None, partition=None,
+             timestamp_ms=None, delivery_timeout_ms=None):
         """Publish a message to a topic.
 
         Arguments:
@@ -921,6 +923,11 @@ class KafkaProducer:
                 are tuples of str key and bytes value.
             timestamp_ms (int, optional): epoch milliseconds (from Jan 1 1970 UTC)
                 to use as the message timestamp. Defaults to current time.
+            delivery_timeout_ms (int, optional): per-send upper bound on the
+                time to report success or failure after this call is accepted.
+                Defaults to the producer-wide ``delivery_timeout_ms``. Records
+                with different values may be batched together and are expired
+                independently before the batch is first sent.
 
         Returns:
             FutureRecordMetadata: resolves to RecordMetadata
@@ -948,6 +955,14 @@ class KafkaProducer:
             raise TypeError('headers must be list-type')
         if not all(isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str) and isinstance(item[1], bytes) for item in headers):
             raise TypeError('All headers items must be (str, bytes) tuples')
+
+        if delivery_timeout_ms is not None:
+            if not isinstance(delivery_timeout_ms, (int, float)) or delivery_timeout_ms <= 0:
+                raise ValueError('delivery_timeout_ms must be a positive number')
+            if delivery_timeout_ms > self.config['delivery_timeout_ms']:
+                raise Errors.KafkaConfigurationError(
+                    'per-send delivery_timeout_ms (%s) cannot exceed producer delivery_timeout_ms (%s)'
+                    % (delivery_timeout_ms, self.config['delivery_timeout_ms']))
 
         key_bytes = self._serialize(
             self.config['key_serializer'],
@@ -983,6 +998,11 @@ class KafkaProducer:
         self._ensure_valid_record_size(message_size)
 
         tp = TopicPartition(topic, partition)
+        send_now = time.monotonic()
+        if delivery_timeout_ms is not None:
+            delivery_deadline = send_now + delivery_timeout_ms / 1000
+        else:
+            delivery_deadline = None
         log.debug("%s: Sending (key=%r value=%r headers=%r) to %s", str(self), key, value, headers, tp)
 
         if self._transaction_manager and self._transaction_manager.is_transactional():
@@ -996,7 +1016,9 @@ class KafkaProducer:
         # the next one.
         sticky_eligible = not explicit_partition and key_bytes is None
         result = self._accumulator.append(tp, timestamp_ms, key_bytes, value_bytes, headers,
-                                          abort_on_new_batch=sticky_eligible)
+                                          abort_on_new_batch=sticky_eligible,
+                                          now=send_now,
+                                          delivery_deadline=delivery_deadline)
         future, batch_is_full, new_batch_created, abort_for_new_batch = result
         if abort_for_new_batch:
             prev_partition = partition
@@ -1009,7 +1031,9 @@ class KafkaProducer:
             if self._transaction_manager and self._transaction_manager.is_transactional():
                 self._transaction_manager.maybe_add_partition_to_transaction(tp)
             result = self._accumulator.append(tp, timestamp_ms, key_bytes, value_bytes, headers,
-                                              abort_on_new_batch=False)
+                                              abort_on_new_batch=False,
+                                              now=send_now,
+                                              delivery_deadline=delivery_deadline)
             future, batch_is_full, new_batch_created, _ = result
 
         if batch_is_full or new_batch_created:

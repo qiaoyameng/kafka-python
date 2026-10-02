@@ -56,7 +56,7 @@ class ProducerBatch:
         base_seq = self.base_sequence
         return base_seq is not None and base_seq != -1
 
-    def try_append(self, timestamp_ms, key, value, headers, now=None):
+    def try_append(self, timestamp_ms, key, value, headers, now=None, delivery_deadline=None):
         metadata = self.records.append(timestamp_ms, key, value, headers)
         if metadata is None:
             return None
@@ -72,8 +72,73 @@ class ProducerBatch:
             len(key) if key is not None else -1,
             len(value) if value is not None else -1,
             sum(len(h_key.encode("utf-8")) + len(h_val) for h_key, h_val in headers) if headers else -1)
+        future.delivery_deadline = delivery_deadline
         self._record_futures.append(future)
         return future
+
+    def earliest_delivery_deadline(self, default_timeout_ms=None):
+        deadlines = [
+            future.delivery_deadline
+            for future in self._record_futures
+            if not future.is_done and future.delivery_deadline is not None
+        ]
+        if deadlines:
+            return min(deadlines)
+        if not any(not future.is_done for future in self._record_futures):
+            return None
+        if default_timeout_ms is None:
+            return None
+        return self.created + default_timeout_ms / 1000
+
+    def has_reached_delivery_timeout(self, delivery_timeout_ms, now=None):
+        now = time.monotonic() if now is None else now
+        deadline = self.earliest_delivery_deadline(delivery_timeout_ms)
+        return deadline is not None and deadline <= now
+
+    def expired_record_indices(self, now=None, delivery_timeout_ms=None):
+        now = time.monotonic() if now is None else now
+        default_deadline = (
+            None if delivery_timeout_ms is None
+            else self.created + delivery_timeout_ms / 1000)
+        return [
+            index
+            for index, future in enumerate(self._record_futures)
+            if not future.is_done
+            and self._record_delivery_deadline(future, default_deadline) is not None
+            and self._record_delivery_deadline(future, default_deadline) <= now
+        ]
+
+    def _record_delivery_deadline(self, future, default_deadline=None):
+        if future.delivery_deadline is not None:
+            return future.delivery_deadline
+        return default_deadline
+
+    def has_expired_records(self, now=None, delivery_timeout_ms=None):
+        return bool(self.expired_record_indices(now, delivery_timeout_ms))
+
+    def unexpired_record_count(self, now=None, delivery_timeout_ms=None):
+        now = time.monotonic() if now is None else now
+        default_deadline = (
+            None if delivery_timeout_ms is None
+            else self.created + delivery_timeout_ms / 1000)
+        return sum(
+            1
+            for index, future in enumerate(self._record_futures)
+            if not future.is_done
+            and self._record_delivery_deadline(future, default_deadline) is not None
+            and self._record_delivery_deadline(future, default_deadline) > now
+        )
+
+    @property
+    def active_record_count(self):
+        return sum(1 for future in self._record_futures if not future.is_done)
+
+    def detach_expired_records(self, indices, exception):
+        for index in indices:
+            future = self._record_futures[index]
+            if not future.is_done:
+                future.detach()
+                future.failure(exception)
 
     def abort(self, exception):
         """Abort the batch and complete the future and callbacks."""
@@ -164,10 +229,6 @@ class ProducerBatch:
         if self.produce_future.is_done:
             raise Errors.IllegalStateError('Batch is already closed!')
         self.produce_future.success((base_offset, timestamp_ms, record_exceptions_fn))
-
-    def has_reached_delivery_timeout(self, delivery_timeout_ms, now=None):
-        now = time.monotonic() if now is None else now
-        return delivery_timeout_ms / 1000 <= now - self.created
 
     def in_retry(self):
         return self._retry
